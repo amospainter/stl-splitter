@@ -3,23 +3,43 @@ jobs (many cuts/connectors) can report incremental status to a caller (e.g.
 the web UI's job polling endpoint)."""
 from __future__ import annotations
 
+import threading
 from typing import Callable
+
+
+class JobCancelled(Exception):
+    """Raised from `ProgressReporter.step()` when a cancellation was
+    requested via its `cancel_event`. Cooperative, not preemptive: it only
+    takes effect at the next call to `step()`, so cancellation lands at the
+    next cut/piece/interface boundary, not instantly mid-boolean-op — Python
+    has no safe way to kill a computation already in flight inside a single
+    thread. `_cut_all_axes`'s parallel branch additionally tears down its
+    process pool on this, which *does* stop in-flight worker processes."""
 
 
 class ProgressReporter:
     """Call `step(message)` at each meaningful milestone. If `set_total` was
     called with a known step count, `fraction` in the callback is 0..1;
-    otherwise it's None (indeterminate progress)."""
+    otherwise it's None (indeterminate progress). Pass `cancel_event` (a
+    `threading.Event`) to let a caller request cancellation from another
+    thread — checked on every `step()` call, raising `JobCancelled` if set."""
 
-    def __init__(self, on_update: Callable[[str, float | None], None] | None = None):
+    def __init__(
+        self,
+        on_update: Callable[[str, float | None], None] | None = None,
+        cancel_event: "threading.Event | None" = None,
+    ):
         self._on_update = on_update
         self._total: int | None = None
         self._done = 0
+        self._cancel_event = cancel_event
 
     def set_total(self, total: int) -> None:
         self._total = max(total, 1)
 
     def step(self, message: str) -> None:
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise JobCancelled()
         self._done += 1
         fraction = min(self._done / self._total, 1.0) if self._total else None
         if self._on_update:

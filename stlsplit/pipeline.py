@@ -12,7 +12,7 @@ from .connectors import SUPPORTED_SHAPES, add_connectors
 from .cutting import cut_mesh
 from .geometry import Cut, CutPlacementError, axis_index, compute_cut_planes, resolve_cuts, scale_mesh
 from .hollow import hollow_mesh
-from .progress import ProgressReporter
+from .progress import JobCancelled, ProgressReporter
 
 # Below this piece count, spinning up a process pool (importing trimesh/
 # manifold3d/shapely fresh in each worker process, roughly 0.5-1s per worker)
@@ -171,14 +171,24 @@ def _cut_all_axes(
                     pool.submit(_process_one_piece, piece.vertices, piece.faces, axis, planes, connector_kwargs)
                     for piece in pieces
                 ]
-                for future in futures:
-                    piece_arrays, dowel_arrays = future.result()
-                    next_pieces.extend(
-                        trimesh.Trimesh(vertices=v, faces=f, process=False) for v, f in piece_arrays
-                    )
-                    dowels.extend(trimesh.Trimesh(vertices=v, faces=f, process=False) for v, f in dowel_arrays)
-                    if progress:
-                        progress.step(f"Split a piece on {axis} axis")
+                try:
+                    for future in futures:
+                        piece_arrays, dowel_arrays = future.result()
+                        next_pieces.extend(
+                            trimesh.Trimesh(vertices=v, faces=f, process=False) for v, f in piece_arrays
+                        )
+                        dowels.extend(trimesh.Trimesh(vertices=v, faces=f, process=False) for v, f in dowel_arrays)
+                        if progress:
+                            progress.step(f"Split a piece on {axis} axis")
+                except JobCancelled:
+                    # Unlike the sequential branch (where a raised exception
+                    # just unwinds the current Python call stack, nothing
+                    # else to clean up), worker processes here are still
+                    # running real CPU-bound work in the background — tear
+                    # the pool down immediately instead of leaving them
+                    # burning cycles on a result nothing will ever consume.
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    raise
         else:
             next_pieces = []
             for piece in pieces:

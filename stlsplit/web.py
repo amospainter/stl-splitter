@@ -30,7 +30,7 @@ from .connectors import SUPPORTED_SHAPES
 from .export import BED_SIZE_PRESETS, DEFAULT_BED_SIZE, SUPPORTED_FORMATS, export_pieces
 from .geometry import CutPlacementError
 from .pipeline import PipelineParams, run_pipeline
-from .progress import ProgressReporter
+from .progress import JobCancelled, ProgressReporter
 
 _STATIC_DIR = Path(__file__).parent / "static"
 
@@ -58,13 +58,14 @@ app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
 @dataclass
 class Job:
-    status: str = "running"  # running | done | error
+    status: str = "running"  # running | done | error | cancelled
     message: str = "Starting..."
     fraction: float | None = None
     result: dict[str, Any] | None = None
     error: str | None = None
     error_axis: str | None = None
     error_positions: list[float] = field(default_factory=list)
+    cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
 _JOBS: dict[str, Job] = {}
@@ -161,7 +162,7 @@ def _run_job(
 
     try:
         mesh = load_mesh_from_bytes(raw, filename, allow_non_watertight=allow_non_watertight)
-        reporter = ProgressReporter(on_update)
+        reporter = ProgressReporter(on_update, cancel_event=job.cancel_event)
         pieces, dowels = run_pipeline(mesh, params, progress=reporter)
 
         basename = os.path.splitext(os.path.basename(filename))[0]
@@ -205,6 +206,9 @@ def _run_job(
         job.status = "done"
         job.message = "Done"
         job.fraction = 1.0
+    except JobCancelled:
+        job.status = "cancelled"
+        job.message = "Cancelled"
     except (ValueError, RuntimeError) as e:
         job.status = "error"
         job.error = str(e)
@@ -315,6 +319,26 @@ async def create_job(
     return JSONResponse({"job_id": job_id})
 
 
+@app.post("/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    """Requests cancellation of a running job. Cooperative, not immediate:
+    `_run_job`'s background thread only notices at its next ProgressReporter
+    checkpoint (the next cut, connector interface, or piece — see
+    JobCancelled), so a very long single boolean op already in flight still
+    has to finish first; the per-piece ProcessPoolExecutor branch in
+    `_cut_all_axes` is the one exception, since it can actually tear down and
+    stop its worker processes rather than just unwinding a call stack.
+    Returns 404 if the job doesn't exist, but always 200 (not an error) if
+    the job already finished by the time this arrives — cancelling something
+    that's already done/failed is a no-op, not a client mistake."""
+    job = _JOBS.get(job_id)
+    if job is None:
+        return JSONResponse({"detail": "Unknown job id"}, status_code=404)
+    if job.status == "running":
+        job.cancel_event.set()
+    return JSONResponse({"status": job.status})
+
+
 @app.post("/plane_preview")
 async def plane_preview(
     file: UploadFile,
@@ -399,6 +423,8 @@ def _job_payload(job: Job) -> dict[str, Any]:
             "error_axis": job.error_axis,
             "error_positions": job.error_positions,
         }
+    if job.status == "cancelled":
+        return {"status": "cancelled"}
     return {"status": "done", "result": job.result}
 
 

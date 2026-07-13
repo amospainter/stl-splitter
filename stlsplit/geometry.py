@@ -2,10 +2,20 @@
 from __future__ import annotations
 
 import math
+import os
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
 import trimesh
+
+# Below this face count, the per-candidate connectivity check (_is_single_
+# component) is already cheap enough (well under a second) that spinning up
+# a process pool costs more than it saves. Above it — the regime where a
+# single refine_cut_planes call can otherwise take tens of seconds to
+# minutes, especially once the spacing-mode retry loop escalates piece
+# count — parallelizing the candidate checks is worth the pool overhead.
+_PARALLEL_FACE_THRESHOLD = 20_000
 
 AXES = {"x": 0, "y": 1, "z": 2}
 
@@ -179,6 +189,33 @@ def compute_cut_planes(
     lo, hi = mesh.bounds[0][idx], mesh.bounds[1][idx]
     span = hi - lo
 
+    # A live process pool, reused across every refine_cut_planes/
+    # _planes_are_safe call this function makes (all the spacing-mode
+    # retry's escalating attempts included) — spawning it once here and
+    # sharing it avoids paying process-startup cost per candidate batch.
+    # Only worth it once each connectivity check is itself expensive; below
+    # the threshold, everything just runs serially as before (executor=None
+    # is threaded through and behaves identically to before this existed).
+    use_parallel = len(mesh.faces) >= _PARALLEL_FACE_THRESHOLD
+    executor = ProcessPoolExecutor(max_workers=os.cpu_count() or 1) if use_parallel else None
+    try:
+        return _compute_cut_planes_inner(mesh, idx, lo, hi, span, spacing, pieces, smart, executor)
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
+
+
+def _compute_cut_planes_inner(
+    mesh: trimesh.Trimesh,
+    idx: int,
+    lo: float,
+    hi: float,
+    span: float,
+    spacing: float | None,
+    pieces: int | None,
+    smart: bool,
+    executor: "ProcessPoolExecutor | None",
+) -> list[float]:
     if pieces is not None:
         if pieces < 1:
             raise ValueError("--pieces must be >= 1")
@@ -192,7 +229,7 @@ def compute_cut_planes(
         # safe cut exists at this exact count, refine_cut_planes does its
         # best and cutting.py will raise a clear, actionable error.
         if smart and planes:
-            planes = refine_cut_planes(mesh, idx, planes, max_piece_size=None)
+            planes = refine_cut_planes(mesh, idx, planes, max_piece_size=None, executor=executor)
         return planes
 
     if spacing <= 0:
@@ -230,10 +267,10 @@ def compute_cut_planes(
         planes = [lo + step * i for i in range(1, n_pieces)]
         if not smart or not planes:
             return planes
-        refined = refine_cut_planes(mesh, idx, planes, max_piece_size=spacing)
+        refined = refine_cut_planes(mesh, idx, planes, max_piece_size=spacing, executor=executor)
         if first_attempt is None:
             first_attempt = refined
-        if _planes_are_safe(mesh, idx, refined, lo, hi):
+        if _planes_are_safe(mesh, idx, refined, lo, hi, executor=executor):
             return refined
         n_pieces += 1
     # Never found a fully safe configuration at any piece count tried — more
@@ -308,16 +345,80 @@ def _is_single_component(mesh: trimesh.Trimesh, axis_idx: int, lo: float | None,
         return True  # don't block refinement on slicing edge cases
 
 
-def _planes_are_safe(mesh: trimesh.Trimesh, axis_idx: int, planes: list[float], lo: float, hi: float) -> bool:
+def _is_single_component_worker(vertices, faces, axis_idx: int, lo: float | None, hi: float | None) -> bool:
+    """Worker body for `_batch_is_safe` below, run in a separate process.
+    Takes plain vertex/face arrays rather than a `Trimesh` for the same
+    reason as `pipeline._process_one_piece`: sidesteps whatever unpicklable
+    cached state (a ray-query engine, etc.) a `Trimesh` may carry rather
+    than depending on what happens to be picklable today.
+
+    An earlier version tried to avoid re-sending the mesh on every task by
+    loading it once per worker via a ProcessPoolExecutor `initializer`
+    instead of as a per-call argument. Measured slower in practice (~144s
+    vs ~121s on a 371k-face real-world mesh) for this workload's actual
+    task counts — the eager, blocking per-worker load plus the extra
+    synchronization it introduces cost more than the repeated pickling it
+    was meant to avoid. Reverted; keep this simpler version unless a
+    measurement says otherwise."""
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    return _is_single_component(mesh, axis_idx, lo, hi)
+
+
+def _batch_is_safe(
+    executor: "ProcessPoolExecutor | None",
+    mesh: trimesh.Trimesh,
+    axis_idx: int,
+    candidates: list[float],
+    left_bound: float,
+    right_bound: float,
+) -> dict[float, bool]:
+    """Check whether each `c` in `candidates` is a safe cut position (both
+    [left_bound, c] and [c, right_bound] are single-component), for the
+    *same* fixed (left_bound, right_bound) pair. Each candidate's check only
+    reads `mesh` — never mutates it — so they're trivially independent, and
+    on a heavy mesh (where each check is a real boolean/slice operation
+    costing well over a tenth of a second) checking a whole batch of
+    candidates concurrently instead of one at a time is the difference
+    between a search that finishes in seconds and one that takes minutes.
+    Falls back to plain sequential checks when no executor was handed in
+    (small/fast meshes — see `_PARALLEL_FACE_THRESHOLD`)."""
+    if executor is None:
+        return {
+            c: _is_single_component(mesh, axis_idx, left_bound, c) and _is_single_component(mesh, axis_idx, c, right_bound)
+            for c in candidates
+        }
+
+    vertices, faces = mesh.vertices, mesh.faces
+    futures = {}
+    for c in candidates:
+        futures[(c, "left")] = executor.submit(_is_single_component_worker, vertices, faces, axis_idx, left_bound, c)
+        futures[(c, "right")] = executor.submit(_is_single_component_worker, vertices, faces, axis_idx, c, right_bound)
+    results = {key: future.result() for key, future in futures.items()}
+    return {c: results[(c, "left")] and results[(c, "right")] for c in candidates}
+
+
+def _planes_are_safe(
+    mesh: trimesh.Trimesh,
+    axis_idx: int,
+    planes: list[float],
+    lo: float,
+    hi: float,
+    executor: "ProcessPoolExecutor | None" = None,
+) -> bool:
     """Whether every slab between consecutive `planes` (and the mesh's own
     bounds) is connectivity-safe, i.e. `refine_cut_planes` found a genuinely
     safe spot for every cut rather than falling back to its best-effort
-    (possibly unsafe) candidate."""
+    (possibly unsafe) candidate. Checks every slab boundary concurrently via
+    `executor` when one was given, rather than one at a time."""
     bounds = [lo, *sorted(planes), hi]
-    return all(
-        _is_single_component(mesh, axis_idx, bounds[i], bounds[i + 1])
+    if executor is None:
+        return all(_is_single_component(mesh, axis_idx, bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1))
+    vertices, faces = mesh.vertices, mesh.faces
+    futures = [
+        executor.submit(_is_single_component_worker, vertices, faces, axis_idx, bounds[i], bounds[i + 1])
         for i in range(len(bounds) - 1)
-    )
+    ]
+    return all(f.result() for f in futures)
 
 
 def refine_cut_planes(
@@ -329,6 +430,7 @@ def refine_cut_planes(
     samples: int = 11,
     improvement_ratio: float = 1.1,
     max_piece_size: float | None = None,
+    executor: "ProcessPoolExecutor | None" = None,
 ) -> list[float]:
     """Nudge each plane within a bounded local window to sit at a larger,
     connectivity-safe cross-section, avoiding thin necks/slivers and the
@@ -342,6 +444,12 @@ def refine_cut_planes(
     up to that same max_piece_size cap, before giving up: a piece coming out
     smaller than the requested spacing/bed size is always acceptable, a
     disconnected floating region never is.
+
+    `executor`, if given, is a live `ProcessPoolExecutor` used to check a
+    whole batch of candidates' connectivity-safety concurrently instead of
+    one at a time (see `_batch_is_safe`) — pass one in for heavy meshes
+    where each check is itself expensive; `compute_cut_planes` decides when
+    that's worth it and owns the executor's lifetime.
     """
     lo, hi = mesh.bounds[0][axis_idx], mesh.bounds[1][axis_idx]
     bounds = [lo, *sorted(planes), hi]
@@ -369,9 +477,6 @@ def refine_cut_planes(
         if full_max_c < full_min_c:
             full_min_c = full_max_c = p
 
-        def safe(c: float) -> bool:
-            return _is_single_component(mesh, axis_idx, left_bound, c) and _is_single_component(mesh, axis_idx, c, right_bound)
-
         chosen = p
         # Widen the search in stages: try a small band around p first so
         # symmetric spacing is preserved when nothing's wrong, then expand
@@ -398,19 +503,25 @@ def refine_cut_planes(
             )
             max_area = scored[0][1] if scored else 0.0
 
-            # `safe()` is expensive (two real mesh `split()` calls, each
-            # O(faces) — on a heavy mesh this dominates runtime completely),
-            # so this checks candidates in the order most likely to succeed
-            # early and stops at the first hit, rather than scoring every
-            # candidate's safety up front. Among candidates within
-            # `improvement_ratio` of the best area found, check whichever is
-            # closest to the original (symmetric) position `p` first — only
-            # actually move the plane when there's a clearly better spot.
+            # Each check is expensive (two real mesh `split()` calls, each
+            # O(faces) — on a heavy mesh this dominates runtime completely).
+            # Serially checking candidates one at a time with early-exit
+            # works well when the first few are usually safe, but on a mesh
+            # where many candidates in a row are genuinely unsafe (e.g. an
+            # appendage that stays disconnected across a wide band), that
+            # degrades to checking almost the whole batch anyway — just one
+            # at a time. So the *whole* batch (near-best-by-proximity, then
+            # the top-K fallback) is checked via `_batch_is_safe`, which runs
+            # them concurrently when `executor` was handed a heavy enough
+            # mesh to be worth it; either way, the result (closest-safe-
+            # candidate, or top-K-by-area fallback) is identical to the old
+            # purely-sequential early-exit version, just not serialized.
             near_best = [c for c, a in scored if max_area <= 0 or a >= max_area / improvement_ratio]
             near_best_by_proximity = sorted(near_best, key=lambda c: abs(c - p))
+            safety = _batch_is_safe(executor, mesh, axis_idx, near_best_by_proximity, left_bound, right_bound)
             found = False
             for c in near_best_by_proximity:
-                if safe(c):
+                if safety[c]:
                     chosen = c
                     found = True
                     break
@@ -423,8 +534,10 @@ def refine_cut_planes(
             # answer anyway, and checking the full sample set here is what
             # made this pathologically slow on large/complex meshes.
             _TOP_K_FALLBACK = 6
-            for c, _a in scored[:_TOP_K_FALLBACK]:
-                if safe(c):
+            fallback_candidates = [c for c, _a in scored[:_TOP_K_FALLBACK]]
+            fallback_safety = _batch_is_safe(executor, mesh, axis_idx, fallback_candidates, left_bound, right_bound)
+            for c in fallback_candidates:
+                if fallback_safety[c]:
                     chosen = c
                     found = True
                     break

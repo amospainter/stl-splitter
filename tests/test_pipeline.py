@@ -151,11 +151,14 @@ def _dumbbell():
 
 
 def test_cut_mesh_raises_clear_error_on_floating_region():
-    # Regression: cutting exactly through the gap between two disconnected
-    # solids must raise a clear, specific CutPlacementError -- not silently
-    # produce a multi-body "piece" that looks fine until it's in a slicer.
+    # Regression: a cut plane perpendicular to the dumbbell's *separation*
+    # axis (Y here, not X -- an X cut at the gap would just cleanly divide
+    # the two lobes) leaves both resulting pieces straddling both
+    # disconnected lobes, which must raise a clear, specific
+    # CutPlacementError -- not silently produce a multi-body "piece" that
+    # looks fine until it's in a slicer.
     m = _dumbbell()
-    resolved = resolve_cuts(m, "x", [0.0])
+    resolved = resolve_cuts(m, "y", [0.0])
     try:
         cut_mesh(m, resolved)
         assert False, "expected CutPlacementError"
@@ -166,13 +169,37 @@ def test_cut_mesh_raises_clear_error_on_floating_region():
 def test_compute_cut_planes_spacing_does_not_over_fragment_unsafe_mesh():
     # Regression: compute_cut_planes's spacing-mode retry loop used to
     # escalate piece count on every unsafe attempt (up to +5 extra) and
-    # return the *most* fragmented one even when none were actually safe --
-    # for a mesh with a genuine, unavoidable pinch (like this dumbbell),
-    # more pieces never fixes it, so it should fall back to the smallest
-    # (first) attempt instead of ballooning to 6+ cuts.
+    # return the *most* fragmented one even when none were actually safe.
+    # Cutting the dumbbell along Y (perpendicular to its X-axis separation)
+    # is unsafe at *every* piece count -- both lobes span the same Y range,
+    # so no Y cut ever isolates them from each other -- which used to mean
+    # this always burned through all 5 extra attempts. More pieces never
+    # fixes that, so it should fall back to the smallest (first) attempt
+    # instead of ballooning to 6+ cuts.
     m = _dumbbell()
-    planes = compute_cut_planes(m, "x", spacing=60.0)
-    assert len(planes) == 1  # was ballooning to 6 before the fix
+    planes = compute_cut_planes(m, "y", spacing=8.0)
+    assert len(planes) <= 2  # was ballooning to 7 before the fix
+
+
+def test_compute_cut_planes_parallel_candidate_search_matches_serial():
+    # Regression: the ProcessPoolExecutor-based candidate-safety-check path
+    # (used on heavy meshes -- see geometry._PARALLEL_FACE_THRESHOLD) must
+    # produce the exact same result as the serial path, just faster. Forces
+    # it on for this small/fast dumbbell mesh by temporarily lowering the
+    # threshold, rather than needing a genuinely heavy fixture in the suite.
+    import stlsplit.geometry as geo
+
+    m = _dumbbell()
+    serial = compute_cut_planes(m, "y", spacing=8.0)
+
+    original_threshold = geo._PARALLEL_FACE_THRESHOLD
+    geo._PARALLEL_FACE_THRESHOLD = 0
+    try:
+        parallel = compute_cut_planes(m, "y", spacing=8.0)
+    finally:
+        geo._PARALLEL_FACE_THRESHOLD = original_threshold
+
+    assert parallel == serial
 
 
 def test_multi_axis_split_uses_parallel_path_and_conserves_watertightness():
@@ -193,6 +220,62 @@ def test_multi_axis_split_uses_parallel_path_and_conserves_watertightness():
     # sockets remove some volume at each interface, but shouldn't come
     # close to the whole piece disappearing
     assert abs(sum(p.volume for p in pieces) - m.volume) < m.volume * 0.05
+
+
+def test_progress_reporter_raises_job_cancelled_when_event_set():
+    # Regression for the web UI's "Cancel" button: ProgressReporter.step()
+    # must raise JobCancelled the moment its cancel_event is set, and must
+    # NOT raise (or otherwise misbehave) when no cancel_event was given, so
+    # every existing non-web caller (CLI, other tests) is unaffected.
+    import threading
+
+    from stlsplit.progress import JobCancelled, ProgressReporter
+
+    reporter_no_event = ProgressReporter()
+    reporter_no_event.step("fine")  # must not raise
+
+    event = threading.Event()
+    reporter = ProgressReporter(cancel_event=event)
+    reporter.step("still fine")
+    event.set()
+    try:
+        reporter.step("should raise")
+        assert False, "expected JobCancelled"
+    except JobCancelled:
+        pass
+
+
+def test_run_pipeline_stops_early_when_cancelled():
+    # End-to-end: a cancel_event set partway through a multi-axis split
+    # must stop run_pipeline via JobCancelled rather than completing, and
+    # must not leave the process pool used for the second axis's parallel
+    # branch hanging around.
+    import threading
+
+    from stlsplit.pipeline import PipelineParams, run_pipeline
+    from stlsplit.progress import JobCancelled, ProgressReporter
+
+    m = trimesh.creation.box(extents=[100, 40, 40])
+    params = PipelineParams(
+        axis_cuts={"x": [-30, -10, 10, 30], "y": [0]},
+        axis_order="xyz",
+        peg_diameter=6, peg_length=4, peg_clearance=0.18, n_pegs=2,
+    )
+    event = threading.Event()
+    steps_seen = []
+
+    def on_update(message, fraction):
+        steps_seen.append(message)
+        if len(steps_seen) == 2:  # cancel partway through, not immediately
+            event.set()
+
+    reporter = ProgressReporter(on_update, cancel_event=event)
+    try:
+        run_pipeline(m, params, progress=reporter)
+        assert False, "expected JobCancelled"
+    except JobCancelled:
+        pass
+    assert len(steps_seen) < 20  # didn't run to completion (would be more steps)
 
 
 def test_hollow_mesh_reduces_volume_and_stays_watertight():

@@ -1,0 +1,19 @@
+Traceback (most recent call last):
+  File "D:\code\stl-splitter\tests\bench_split.py", line 55, in <module>
+    main()
+  File "D:\code\stl-splitter\tests\bench_split.py", line 44, in main
+    _report(
+  File "D:\code\stl-splitter\tests\bench_split.py", line 29, in _report
+    pieces, dowels = run_pipeline(mesh, params)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\code\stl-splitter\stlsplit\pipeline.py", line 283, in run_pipeline
+    pieces = _cut_mesh_or_raise(mesh, resolved, params.axis, progress)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\code\stl-splitter\stlsplit\pipeline.py", line 29, in _cut_mesh_or_raise
+    return cut_mesh(mesh, resolved, progress=progress)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\code\stl-splitter\stlsplit\cutting.py", line 69, in cut_mesh
+    _check_no_floating_regions(piece, i)
+  File "D:\code\stl-splitter\stlsplit\cutting.py", line 37, in _check_no_floating_regions
+    raise CutPlacementError(
+stlsplit.geometry.CutPlacementError: Piece 2 split into 2 disconnected regions instead of one solid — a cut plane landed where the model pinches to nothing. (axis z, cut position 78.38mm or 121.81mm) Try moving that cut, changing its tilt, or picking a different axis.

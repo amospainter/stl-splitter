@@ -4,7 +4,7 @@
 // properties and have the DOM update itself, instead of manually re-rendering
 // on every change.
 import { reactive, computed, watch } from "vue";
-import { startJob, streamJob, planePreview } from "./api.js";
+import { startJob, streamJob, cancelJob, planePreview } from "./api.js";
 import { AXIS_INDEX } from "./viewer.js";
 import { PRESET_FIELDS } from "./presets.js";
 
@@ -235,14 +235,39 @@ export function useSplitForm() {
   });
 
   const job = reactive({
-    status: "idle", // idle | running | done | error
+    status: "idle", // idle | running | done | error | cancelled
     message: "",
     fraction: null,
     error: null,
     errorAxis: null,
     errorPositions: [],
     result: null,
+    submittedSignature: null,
+    jobId: null,
   });
+
+  // Everything that actually affects the split output (cut planes, scale,
+  // connector params, etc. — everything buildJobFormData sends except the
+  // file itself), condensed to a comparable string. The plane editor stays
+  // open and editable after a split finishes (dragging a cut, changing
+  // connector settings, etc. all still work), but without this there was no
+  // way to tell whether the pieces on screen still reflect what's currently
+  // configured, or a "Split & preview" from before the last edit — resultStale
+  // below is what drives the "Regenerate" prompt in App.js.
+  function fieldsSignature() {
+    return JSON.stringify({
+      axis: form.axis, scale: form.scale, target_dim: form.target_dim, axis_order: form.axis_order,
+      cuts: AXES.map((a) => axisControllers[a].serialize()),
+      peg_diameter: form.peg_diameter, peg_length: form.peg_length, peg_clearance: form.peg_clearance,
+      n_pegs: form.n_pegs, min_wall_thickness: form.min_wall_thickness, alignment_key: form.alignment_key,
+      dowel_shape: form.dowel_shape, no_connectors: form.no_connectors, hollow_wall: form.hollow_wall,
+      allow_non_watertight: form.allow_non_watertight, format: form.format, bed_size: form.bed_size,
+    });
+  }
+
+  const resultStale = computed(() =>
+    job.status === "done" && job.submittedSignature !== null && fieldsSignature() !== job.submittedSignature
+  );
 
   function clearErrorHighlights() {
     AXES.forEach((a) => {
@@ -284,6 +309,7 @@ export function useSplitForm() {
   }
 
   async function submit() {
+    const signature = fieldsSignature();
     job.status = "running";
     job.message = "Starting...";
     job.fraction = null;
@@ -291,11 +317,14 @@ export function useSplitForm() {
     job.errorAxis = null;
     job.errorPositions = [];
     job.result = null;
+    job.jobId = null;
     clearErrorHighlights();
 
     let jobId;
     try {
       jobId = await startJob(buildJobFormData());
+      job.submittedSignature = signature;
+      job.jobId = jobId;
     } catch (err) {
       job.status = "error";
       job.error = err.message;
@@ -306,6 +335,11 @@ export function useSplitForm() {
       if (data.status === "running") {
         job.message = data.message;
         job.fraction = data.fraction;
+        return;
+      }
+      if (data.status === "cancelled") {
+        job.status = "cancelled";
+        job.message = "Cancelled";
         return;
       }
       if (data.status === "error") {
@@ -321,6 +355,20 @@ export function useSplitForm() {
       job.status = "done";
       job.result = data.result;
     });
+  }
+
+  // Cooperative — see progress.py's JobCancelled. The server notices at its
+  // next checkpoint (next cut/interface/piece), not instantly, so `job`
+  // stays "running" with its existing message/progress bar until the
+  // "cancelled" SSE message actually arrives; this just requests it.
+  async function cancel() {
+    if (job.status !== "running" || !job.jobId) return;
+    try {
+      await cancelJob(job.jobId);
+    } catch (err) {
+      // Best-effort: if the request itself fails (e.g. connection drop),
+      // there's nothing more useful to do than leave the job running.
+    }
   }
 
   function onFileSelected(file) {
@@ -343,8 +391,8 @@ export function useSplitForm() {
   }
 
   return {
-    form, axisControllers, job, anyAxisUsable,
+    form, axisControllers, job, anyAxisUsable, resultStale,
     refreshAllAxisPreviews,
-    onFileSelected, submit, applyPreset,
+    onFileSelected, submit, cancel, applyPreset,
   };
 }

@@ -107,6 +107,45 @@ few candidates by area instead of the whole sample set — same result
 widening stages (4 → 3) and samples per stage (15 → 11). Net effect on a
 151k-face test mesh: ~75s → ~32s for the slow axis.
 
+**Perf note 2b:** the spacing-mode retry loop above had a second bug even
+after the retry cap was fixed: it kept overwriting its best-effort fallback
+with the *latest* (most fragmented) attempt on every failed retry, on the
+theory that more pieces is generally safer. For a mesh with a genuinely
+unavoidable pinch (an appendage that only reconnects to the main body
+outside the slab a cut would create — e.g. a tail or limb), more pieces
+never actually fixes it, so this always burned through all 5 extra attempts
+and returned the most-fragmented one: a request that should need 1-2 cuts
+came back with 6+. Fixed by falling back to the *first* (smallest,
+closest-to-requested-spacing) attempt instead — `cutting.py`'s real
+post-cut check is still the actual safety net regardless of which attempt
+is returned here.
+
+**Perf note 2c:** `refine_cut_planes`'s candidate-safety search (see perf
+note 2) is now also parallelized across candidates via a
+`ProcessPoolExecutor`, for the same reason as perf note 3 below — each
+candidate's connectivity check only *reads* the mesh, so a whole batch
+(the closest-to-ideal candidates, then the top-K-by-area fallback) can be
+checked concurrently instead of one at a time with early-exit. This
+matters most exactly when the search is otherwise slowest: a mesh where
+many candidates in a row are genuinely unsafe (e.g. the same
+unavoidable-appendage case from 2b) degrades the old early-exit strategy
+into checking almost the whole batch anyway, just serially. One executor is
+created per `compute_cut_planes` call and reused across every
+`refine_cut_planes`/safety-check it makes, including all of the spacing
+mode's escalating retry attempts, so pool-startup cost is paid once, not
+per candidate batch. Only enabled above `_PARALLEL_FACE_THRESHOLD` (20k
+faces) — below that, each check is already well under a second and
+spawning processes costs more than it saves; verified by measurement, not
+assumption, since an early attempt at an additional optimization here (an
+`initializer`-based pool that loads the mesh once per worker instead of
+once per task) turned out *slower* in practice (~144s vs ~121s on a
+371k-face test file) — the eager, blocking per-worker load plus its
+synchronization cost more than the repeated pickling it aimed to avoid,
+given how few total candidates this workload actually checks. Net effect on
+that same 371k-face file (500mm target height, 250mm bed spacing, Y axis):
+~206s → ~121s, same result (a single genuinely-safe cut) either way —
+parallelizing changed the wall-clock time, not the outcome.
+
 **Perf note 3:** `_cut_all_axes` (`stlsplit/pipeline.py`), used for every
 multi-axis split (which is all of them from the web UI — see above), used to
 process one top-level piece at a time even on the *second* and later axes,
@@ -148,6 +187,23 @@ Note this means the web UI always submits an explicit list of cut planes
 from its siblings, which isn't representable in a single flat, editable
 plane list. The web UI's bed fields are a one-shot seed value for that
 tradeoff, not the same recursive algorithm.
+
+### Cancelling a running split
+
+A "Cancel" button appears next to "Split & preview" while a job is running
+(`POST /jobs/{job_id}/cancel`, which just sets a `threading.Event` on the
+job). Cancellation is **cooperative, not instant**: `ProgressReporter.step()`
+(called `stlsplit/progress.py`) is where it's actually checked, so it takes
+effect at the next cut/connector-interface/piece boundary, not mid-operation
+— Python has no safe way to kill a computation already running inside a
+thread. On the per-piece `ProcessPoolExecutor` branch in `_cut_all_axes`
+(pipeline.py, see the parallelization perf notes above) this can mean
+waiting for whichever future is first to finish before the cancel is
+noticed, since that's the next checkpoint — but once noticed, the pool is
+torn down immediately (`cancel_futures=True`), which does stop any
+still-pending worker processes rather than waiting for all of them. A
+cancelled job shows a neutral "Cancelled" message (`job.status ===
+'cancelled'` in `state.js`), distinct from an error.
 
 ### Saved settings
 
@@ -195,29 +251,32 @@ stlsplit/static/
     config.js               -- small static config mirrored from the Python side (e.g. dowel shapes)
     presets.js              -- localStorage-backed named settings presets
     components/
-      App.js                -- root layout, wires the store to every section
-      InputSection.js, PresetBar.js, SplitSection.js, ConnectorsSection.js,
-      OutputSection.js       -- always-open, core-to-every-run sections
-      ScaleSection.js, InteriorSection.js  -- CollapsibleCard-based, closed by
-                               default (occasional/optional settings)
-      CollapsibleCard.js      -- a whole card that starts collapsed (Scale, Interior)
-      CollapsePanel.js        -- an inline "Advanced" toggle within a section
-                               (cut order in Split, socket/clearance/count in Connectors)
+      App.js                -- root layout, wires the store + tab state to every section
+      InputSection.js, PresetBar.js  -- always-visible, above the tabs
+      TabNav.js               -- the Split/Connectors/Output/Advanced tab strip
+      SplitSection.js, ConnectorsSection.js, OutputSection.js,
+      AdvancedSection.js      -- one per tab (Advanced = Scale + Interior)
       AxisPlaneEditor.js     -- per-axis cut-plane list (drag position/tilt, add/remove/hide)
       MeshViewer.js           -- <mesh-viewer> component, one three.js scene per instance
       ProgressBar.js, PieceGrid.js, PieceCard.js, ResultModal.js
 ```
 
-Form sections are ordered and split core-vs-advanced deliberately: **Input →
-Saved settings → Split → Connectors → Output** are always expanded (needed on
-essentially every run), with fine-tuning that most users leave at defaults
-(cut order; socket depth/clearance/count/min-wall-thickness) tucked behind an
-inline "Advanced" `CollapsePanel` within those sections. **Scale** and
-**Interior** are `CollapsibleCard`s, collapsed by default, since they're only
-relevant some of the time. The whole sidebar is also noticeably denser than
-plain Bootstrap defaults (see the `.split-form` density rules in `app.css`)
-— this is a form with a lot of fields, not a handful, so default card/input
-padding added up to a lot of unnecessary scrolling.
+The sidebar uses a **tab strip** (`TabNav.js`, plain `v-show` per tab, no
+bootstrap.js) rather than stacking every section vertically: **Split /
+Connectors / Output / Advanced** (Scale + Interior). `InputSection` and
+`PresetBar` sit above the tabs since they apply regardless of which tab is
+open. Earlier this used per-section collapse toggles instead
+(`CollapsePanel`/`CollapsibleCard`, since removed) — those hid rarely-used
+fields (cut order, socket depth/clearance/count) behind an extra click even
+within a section a user was already looking at; tabs remove that extra click
+by scoping *whole groups* of fields to when they're relevant, and every field
+within an open tab is directly visible (see the `.section-block` rules in
+`app.css` for the small header-plus-rule style used to group fields within
+a tab, in place of the old boxed cards). The whole sidebar is also
+noticeably denser than plain Bootstrap defaults (see the `.split-form`
+density rules in `app.css`) — this is a form with a lot of fields, not a
+handful, so default card/input padding added up to a lot of unnecessary
+scrolling.
 
 The sidebar is a **fixed width** (380px, 420px above a 1400px viewport), not
 a proportional Bootstrap column — on a very wide monitor a percentage-based

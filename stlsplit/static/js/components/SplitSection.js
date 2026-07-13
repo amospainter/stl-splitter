@@ -1,25 +1,20 @@
-import CollapsePanel from "./CollapsePanel.js";
-
 export default {
   name: "SplitSection",
-  components: { CollapsePanel },
   props: {
     form: { type: Object, required: true },
     axisControllers: { type: Object, required: true },
   },
   template: `
-    <div class="card mb-3">
-      <div class="card-header fw-semibold">Split</div>
-      <div class="card-body">
+    <div>
+      <div class="section-block">
+        <div class="section-block-header"><i class="bi bi-grid-3x3-gap"></i> Per-axis split</div>
         <div class="form-text mb-2">Spacing, piece count, or bed size per axis — set any one to split on that axis, leave blank to skip it.</div>
 
-        <table class="table table-sm align-middle mb-1">
+        <table class="table table-sm align-middle mb-0">
           <thead>
-            <tr class="text-secondary" style="font-size: 0.72rem">
+            <tr class="text-secondary" style="font-size: 0.68rem">
               <th></th><th>Spacing (mm)</th><th>Pieces</th>
-              <th>
-                Bed (mm)
-              </th>
+              <th>Bed (mm)</th>
             </tr>
           </thead>
           <tbody>
@@ -40,19 +35,20 @@ export default {
             </tr>
           </tbody>
         </table>
+      </div>
 
-        <collapse-panel label="Advanced: cut order">
-          <label class="form-label">Cut order (when splitting on more than one axis)</label>
-          <select class="form-select" v-model="form.axis_order">
-            <option value="zxy">Z, then X, then Y</option>
-            <option value="zyx">Z, then Y, then X</option>
-            <option value="xyz">X, then Y, then Z</option>
-            <option value="xzy">X, then Z, then Y</option>
-            <option value="yxz">Y, then X, then Z</option>
-            <option value="yzx">Y, then Z, then X</option>
-          </select>
-          <div class="form-text">Cutting the primary/tall axis first tends to leave larger, better-connected pieces, lowering the odds of a floating-region failure on later cuts. Bed size auto-fills that axis's spacing (still editable in the plane editor below, and fit-checked as you drag) rather than using a separate auto-fit mode.</div>
-        </collapse-panel>
+      <div class="section-block">
+        <div class="section-block-header"><i class="bi bi-arrow-down-up"></i> Cut order</div>
+        <label class="form-label">Order to apply axes in (when splitting on more than one)</label>
+        <select class="form-select" v-model="form.axis_order">
+          <option value="zxy">Z, then X, then Y</option>
+          <option value="zyx">Z, then Y, then X</option>
+          <option value="xyz">X, then Y, then Z</option>
+          <option value="xzy">X, then Z, then Y</option>
+          <option value="yxz">Y, then X, then Z</option>
+          <option value="yzx">Y, then Z, then X</option>
+        </select>
+        <div class="form-text">Cutting the primary/tall axis first tends to leave larger, better-connected pieces, lowering the odds of a floating-region failure on later cuts. If one axis keeps needing far more cuts than its bed size should require, try reordering (or dropping) that axis — it may have geometry (an appendage, a coiled tail) that only reconnects to the rest of the model outside the range a cut on that axis can avoid.</div>
       </div>
     </div>
   `,

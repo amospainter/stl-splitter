@@ -11,6 +11,15 @@ export async function startJob(formData) {
   return data.job_id;
 }
 
+// Requests cancellation of a running job. Cooperative on the server side
+// (see progress.py's JobCancelled) — this just flips a flag and returns;
+// the job's own SSE stream (already subscribed via streamJob) is what tells
+// the caller it actually stopped, via a "cancelled" status message.
+export async function cancelJob(jobId) {
+  const resp = await fetch(`/jobs/${jobId}/cancel`, { method: "POST" });
+  if (!resp.ok) throw new Error("Failed to cancel job");
+}
+
 // Subscribes to a job's progress over Server-Sent Events (replaces the old
 // client-side setTimeout poll loop against GET /jobs/{id} — the browser's
 // native EventSource keeps one connection open and the server pushes a

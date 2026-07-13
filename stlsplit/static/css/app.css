@@ -16,7 +16,16 @@
   flex: 0 0 380px;
   width: 380px;
   position: sticky; top: 16px;
-  max-height: calc(100vh - 32px);
+  /* `height`, not `max-height`: with only max-height, a short tab's content
+     (e.g. just the Split tab) let the sidebar shrink-wrap well above the
+     viewport bottom, leaving a tall dead gap below it whenever the preview
+     pane (which can be much taller — plane editors, piece grids) pushed the
+     page past one screen. A fixed height keeps it filling the viewport
+     (scrolling internally via overflow-y when a tab's content is taller
+     than that) regardless of how short the current tab's content is. */
+  height: calc(100vh - 32px);
+  display: flex;
+  flex-direction: column;
   overflow-y: auto;
   scrollbar-width: thin;
 }
@@ -27,20 +36,45 @@
    long. Scoped to .split-form so the preview pane (piece cards, etc.) keeps
    normal Bootstrap sizing — this is specifically about packing a lot of
    inputs into a narrow sidebar without it turning into a scroll marathon. */
-.split-form .card { margin-bottom: 0.6rem; }
-.split-form .card-header { padding: 0.4rem 0.65rem; font-size: 0.82rem; }
-.split-form .card-body { padding: 0.55rem 0.7rem; }
-.split-form label.form-label { margin-bottom: 0.15rem; font-size: 0.76rem; }
+.split-form .card { margin-bottom: 0.5rem; }
+.split-form .card-header { padding: 0.35rem 0.6rem; font-size: 0.78rem; }
+.split-form .card-body { padding: 0.5rem 0.6rem; }
+.split-form label.form-label { margin-bottom: 0.1rem; font-size: 0.72rem; }
 .split-form .form-control, .split-form .form-select {
-  padding: 0.25rem 0.5rem; font-size: 0.82rem; min-height: 30px;
+  padding: 0.2rem 0.45rem; font-size: 0.78rem; min-height: 27px;
 }
-.split-form .form-check { margin-top: 0.35rem; }
-.split-form .form-check-input { width: 1em; height: 1em; }
-.split-form .form-check-label { font-size: 0.8rem; }
-.split-form .form-text { font-size: 0.72rem; margin-top: 0.15rem; }
-.split-form .row.g-2 { --bs-gutter-x: 0.5rem; --bs-gutter-y: 0.4rem; }
-.split-form .axis-row-label { font-size: 0.8rem; font-weight: 600; }
-.split-form .collapse-panel .btn-link { font-size: 0.78rem; }
+.split-form .form-check { margin-top: 0.3rem; }
+.split-form .form-check-input { width: 0.95em; height: 0.95em; }
+.split-form .form-check-label { font-size: 0.76rem; }
+.split-form .form-text { font-size: 0.68rem; margin-top: 0.1rem; }
+.split-form .row.g-2 { --bs-gutter-x: 0.5rem; --bs-gutter-y: 0.3rem; }
+.split-form .axis-row-label { font-size: 0.76rem; font-weight: 600; }
+.split-form table.table { font-size: 0.78rem; }
+.split-form table.table td { padding: 0.25rem 0.3rem; }
+
+/* Top-level section navigation (Split / Connectors / Output / Advanced) —
+   a tab strip instead of stacking every section vertically, so only the
+   fields relevant to what the user is currently configuring take up space. */
+.section-tabs { font-size: 0.78rem; }
+.section-tabs .nav-link {
+  padding: 0.3rem 0.7rem; color: var(--bs-secondary-color);
+  border-top-left-radius: 0.3rem; border-top-right-radius: 0.3rem;
+}
+.section-tabs .nav-link.active { font-weight: 600; }
+
+/* A named sub-group within a tab (e.g. "Cut order", "Socket & fit") —
+   deliberately lighter than a full Bootstrap card: no border/box, just a
+   small bold header with an icon and a thin rule, so a tab with several
+   sub-groups reads like organized groups of fields rather than a stack of
+   boxes within a box. */
+.section-block { margin-bottom: 0.85rem; }
+.section-block:last-child { margin-bottom: 0; }
+.section-block-header {
+  font-size: 0.76rem; font-weight: 600; margin-bottom: 0.4rem;
+  padding-bottom: 0.25rem; border-bottom: 1px solid var(--bs-border-color);
+  display: flex; align-items: center; gap: 0.4rem;
+}
+.section-block-header .bi { color: var(--bs-secondary-color); }
 
 .mesh-viewer { position: relative; width: 100%; background: #0e0f13; border-radius: var(--bs-border-radius); overflow: hidden; }
 .mesh-viewer-canvas { width: 100%; height: 100%; }
@@ -64,6 +98,12 @@
 #submit-bar {
   position: sticky; bottom: 0; margin: 0.8em -2px -2px; padding: 10px 2px 2px;
   background: linear-gradient(180deg, transparent, var(--bs-body-bg) 35%);
+  /* .split-form is a flex column now (see .layout > .split-form) so this
+     auto margin pushes the button to the bottom of the sidebar's full
+     viewport-height box on a short tab (Output, say) instead of leaving it
+     stranded right under the last field with empty space beneath it; still
+     sticky for tabs whose content actually overflows that height. */
+  margin-top: auto;
 }
 .split-form.busy { opacity: 0.85; }
 
