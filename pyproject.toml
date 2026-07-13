@@ -1,0 +1,37 @@
+[project]
+name = "stlsplit"
+version = "0.1.0"
+description = "Scale, split, and re-connect large STL prints into bed-sized pieces"
+requires-python = ">=3.11"
+dependencies = [
+    "trimesh>=4.0",
+    "manifold3d>=2.3",
+    "numpy>=1.24",
+    "shapely>=2.0",
+    "scipy>=1.11",
+    "networkx>=3.0",
+    "rtree>=1.0",
+    "lxml>=5.0",
+    "scikit-image>=0.22",
+]
+
+[project.optional-dependencies]
+web = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "python-multipart>=0.0.9",
+]
+
+[project.scripts]
+stlsplit = "stlsplit.cli:main"
+stlsplit-web = "stlsplit.web:run"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["stlsplit*"]
+
+[tool.setuptools.package-data]
+stlsplit = ["static/**"]

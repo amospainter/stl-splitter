@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m venv .venv)",
+      "Bash(./.venv/Scripts/python.exe -m pip install -q --upgrade pip)",
+      "Bash(./.venv/Scripts/python.exe -m pip install -q -e .)",
+      "Bash(./.venv/Scripts/python.exe -c \"import trimesh, manifold3d; print\\(trimesh.__version__, manifold3d.__version__\\)\")",
+      "Bash(./.venv/Scripts/python.exe -c ' *)",
+      "Bash(./.venv/Scripts/python.exe -m stlsplit.cli tests/box.stl --axis z --pieces 3 --out out)",
+      "Bash(./.venv/Scripts/stlsplit.exe tests/box.stl --target-dim 120 --axis z --spacing 40 --out out2)",
+      "Bash(.venv/Scripts/python -c \"import stlsplit.cli, stlsplit.web, stlsplit.geometry\")",
+      "Bash(.venv/Scripts/python -m stlsplit.cli --help)",
+      "Bash(.venv/Scripts/python -c \"import stlsplit.web\")",
+      "Bash(pkill -f \"stlsplit.web\")",
+      "Bash(.venv/Scripts/python -c ' *)"
+    ]
+  }
+}

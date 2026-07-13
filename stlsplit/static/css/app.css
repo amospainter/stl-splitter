@@ -1,0 +1,95 @@
+/* Everything else (buttons, cards, forms, alerts, progress, badges, modal
+   chrome) comes from Bootstrap; this file only covers what it doesn't:
+   the three.js viewer, the plane-editor gizmo swatches, and layout details
+   specific to this app. */
+
+.app-footer { border-top: 1px solid var(--bs-border-color); }
+
+/* Sidebar is a fixed width rather than a proportional Bootstrap column
+   (col-lg-4 etc.): on a wide/4K viewport a percentage-based sidebar grows
+   far past what a single-column settings form needs, leaving form fields
+   stretched and the split awkward. A fixed width plus a fluid preview pane
+   scales far better — the extra space goes to the part that actually
+   benefits from it (the 3D viewer, the piece grid), not empty input padding. */
+.layout { display: flex; gap: 1.5rem; align-items: flex-start; }
+.layout > .split-form {
+  flex: 0 0 380px;
+  width: 380px;
+  position: sticky; top: 16px;
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+.layout > .preview-pane { flex: 1 1 auto; min-width: 0; }
+
+/* Compact form density: the default Bootstrap card/form spacing reads fine
+   for a handful of fields but adds up badly across a settings form this
+   long. Scoped to .split-form so the preview pane (piece cards, etc.) keeps
+   normal Bootstrap sizing — this is specifically about packing a lot of
+   inputs into a narrow sidebar without it turning into a scroll marathon. */
+.split-form .card { margin-bottom: 0.6rem; }
+.split-form .card-header { padding: 0.4rem 0.65rem; font-size: 0.82rem; }
+.split-form .card-body { padding: 0.55rem 0.7rem; }
+.split-form label.form-label { margin-bottom: 0.15rem; font-size: 0.76rem; }
+.split-form .form-control, .split-form .form-select {
+  padding: 0.25rem 0.5rem; font-size: 0.82rem; min-height: 30px;
+}
+.split-form .form-check { margin-top: 0.35rem; }
+.split-form .form-check-input { width: 1em; height: 1em; }
+.split-form .form-check-label { font-size: 0.8rem; }
+.split-form .form-text { font-size: 0.72rem; margin-top: 0.15rem; }
+.split-form .row.g-2 { --bs-gutter-x: 0.5rem; --bs-gutter-y: 0.4rem; }
+.split-form .axis-row-label { font-size: 0.8rem; font-weight: 600; }
+.split-form .collapse-panel .btn-link { font-size: 0.78rem; }
+
+.mesh-viewer { position: relative; width: 100%; background: #0e0f13; border-radius: var(--bs-border-radius); overflow: hidden; }
+.mesh-viewer-canvas { width: 100%; height: 100%; }
+/* Scales with viewport height on large screens (more vertical room to work
+   with) but never shrinks below a usable size or grows absurdly tall. */
+.editor-wrap .mesh-viewer { height: clamp(420px, 62vh, 800px); }
+
+.view-toolbar { position: absolute; top: 10px; right: 10px; z-index: 10; }
+
+.plane-swatch { flex: 0 0 10px; width: 10px; height: 10px; border-radius: 50%; }
+.plane-item.cut-hidden .plane-label,
+.plane-item.cut-hidden .plane-value,
+.plane-item.cut-hidden .tilt-label,
+.plane-item.cut-hidden .tilt-value { opacity: 0.45; }
+.plane-item.cut-error {
+  background: rgba(239, 68, 68, 0.12); border: 1px solid rgba(239, 68, 68, 0.5);
+  border-radius: var(--bs-border-radius); padding: 6px 8px; margin: -6px -8px;
+}
+.plane-item.cut-error .plane-label { color: #fda4af; font-weight: 700; }
+
+#submit-bar {
+  position: sticky; bottom: 0; margin: 0.8em -2px -2px; padding: 10px 2px 2px;
+  background: linear-gradient(180deg, transparent, var(--bs-body-bg) 35%);
+}
+.split-form.busy { opacity: 0.85; }
+
+.piece-card { position: relative; overflow: hidden; }
+.piece-canvas { width: 100%; height: 160px; display: block; cursor: pointer; }
+.piece-canvas .mesh-viewer { height: 100%; }
+.expand-btn {
+  position: absolute; top: 6px; right: 6px; width: 30px; height: 30px;
+  display: flex; align-items: center; justify-content: center; padding: 0;
+  opacity: 0; transition: opacity 0.15s ease;
+}
+.piece-card:hover .expand-btn, .piece-card:focus-within .expand-btn { opacity: 1; }
+
+#modal-box .mesh-viewer, .modal-body .mesh-viewer { height: 100%; border-radius: 0; }
+.modal-content { display: flex; flex-direction: column; }
+
+@media (max-width: 991.98px) {
+  .layout { flex-direction: column; }
+  .layout > .split-form { position: static; max-height: none; width: 100%; flex-basis: auto; }
+  .editor-wrap .mesh-viewer { height: 60vh; min-height: 320px; }
+  #submit-bar { position: static; background: none; margin: 0.8em 0 0; }
+}
+
+/* Above the sidebar+preview breakpoint, widen the sidebar a little on very
+   large screens too (comfortable reading width for labels/inputs) without
+   letting it grow proportionally the way a Bootstrap column would. */
+@media (min-width: 1400px) {
+  .layout > .split-form { flex-basis: 420px; width: 420px; }
+}
