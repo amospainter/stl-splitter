@@ -2,6 +2,13 @@ import { computed } from "vue";
 import { paletteHex } from "../viewer.js";
 
 const TILT_LABELS = { x: ["Tilt Y", "Tilt Z"], y: ["Tilt X", "Tilt Z"], z: ["Tilt X", "Tilt Y"] };
+// Kept short of a true +/-90 (which would make the plane's normal parallel
+// to the cut axis -- a degenerate, zero-thickness slice) but well past the
+// old +/-75 cap some users were bumping into on genuinely steep cuts.
+export const TILT_MAX = 85;
+// Backs the <input list="..."> tick marks on the tilt sliders below --
+// round 15-degree steps plus both endpoints.
+export const TILT_TICKS = [-85, -75, -60, -45, -30, -15, 0, 15, 30, 45, 60, 75, 85];
 
 export default {
   name: "AxisPlaneEditor",
@@ -15,6 +22,10 @@ export default {
         <span class="fw-semibold small text-uppercase">{{ axisName.toUpperCase() }}</span>
         <span class="spinner-border spinner-border-sm text-secondary" v-if="controller.state.loading"></span>
         <span class="text-secondary small flex-grow-1">{{ hint }}</span>
+        <button type="button" class="btn btn-outline-secondary btn-sm" v-if="controller.state.loading"
+                @click="controller.stopPreview()">
+          <i class="bi bi-stop-fill me-1"></i>Stop
+        </button>
         <button type="button" class="btn btn-outline-primary btn-sm" @click="controller.addCut()">
           <i class="bi bi-plus-lg me-1"></i>Add cut
         </button>
@@ -42,7 +53,7 @@ export default {
           </div>
           <div class="tilt-row d-flex align-items-center gap-2 ps-4" v-for="field in ['tiltA', 'tiltB']" :key="field">
             <span class="tilt-label small text-secondary" style="flex: 0 0 46px">{{ tiltLabel(field) }}</span>
-            <input type="range" class="form-range flex-grow-1" min="-75" max="75" step="1"
+            <input type="range" class="form-range flex-grow-1" :min="-tiltMax" :max="tiltMax" step="1" :list="tiltTicksId"
                    v-model.number="cut[field]"
                    :style="{ accentColor: paletteHex(i) }"
                    @pointerdown="cut.active = true" @change="cut.active = false">
@@ -50,6 +61,9 @@ export default {
           </div>
         </div>
       </div>
+      <datalist :id="tiltTicksId">
+        <option v-for="t in tiltTicks" :key="t" :value="t"></option>
+      </datalist>
     </div>
   `,
   setup(props) {
@@ -64,6 +78,9 @@ export default {
     function tiltLabel(field) {
       return TILT_LABELS[props.axisName][field === "tiltA" ? 0 : 1];
     }
-    return { lo, hi, step, hint, paletteHex, tiltLabel };
+    return {
+      lo, hi, step, hint, paletteHex, tiltLabel,
+      tiltMax: TILT_MAX, tiltTicks: TILT_TICKS, tiltTicksId: `tilt-ticks-${props.axisName}`,
+    };
   },
 };

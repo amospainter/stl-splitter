@@ -3,11 +3,27 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
 import trimesh
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+
+from .progress import JobCancelled
+
+
+def _check_cancelled(cancel_event: "threading.Event | None") -> None:
+    """Raise `JobCancelled` if `cancel_event` is set. Checked periodically
+    inside `compute_cut_planes`'s search loops (the pinch-avoidance window
+    search and the spacing-mode retry loop), which can each run for tens of
+    seconds on a large/complex mesh — this is what lets the web UI's
+    "Stop" control on a live plane-preview actually abort the computation,
+    not just discard the eventual response."""
+    if cancel_event is not None and cancel_event.is_set():
+        raise JobCancelled("Plane computation cancelled")
 
 # Below this face count, the per-candidate connectivity check (_is_single_
 # component) is already cheap enough (well under a second) that spinning up
@@ -170,6 +186,8 @@ def compute_cut_planes(
     spacing: float | None = None,
     pieces: int | None = None,
     smart: bool = True,
+    executor: "ProcessPoolExecutor | None" = None,
+    cancel_event: "threading.Event | None" = None,
 ) -> list[float]:
     """Return sorted list of coordinate positions (along axis) where cuts occur.
 
@@ -179,6 +197,22 @@ def compute_cut_planes(
     cross-section of larger area — steering cuts away from thin necks and
     slivers, and away from spots where the piece on either side would come
     apart into disconnected floating regions.
+
+    `executor`, if given, is used directly for any parallel connectivity
+    checks and is NOT shut down here — the caller owns its lifetime (e.g.
+    `autofit.auto_fit_split`, which reuses one pool across its whole
+    recursion instead of paying pool-startup cost at every level). When
+    `executor` is None (the default), this function decides for itself
+    whether the mesh is heavy enough to warrant a pool, creates one, and
+    shuts it down before returning — unchanged from before this parameter
+    existed.
+
+    `cancel_event`, if given, is checked periodically during the search below
+    (see `_check_cancelled`) and raises `progress.JobCancelled` as soon as
+    it's set, rather than only after the whole (potentially tens-of-seconds)
+    computation finishes — used by the web UI's live plane-preview "Stop"
+    control (`stlsplit/web.py`'s `/plane_preview` endpoint), which has no
+    other way to interrupt this synchronous, CPU-bound search once started.
     """
     if spacing is None and pieces is None:
         raise ValueError("Specify one of --spacing or --pieces")
@@ -189,6 +223,29 @@ def compute_cut_planes(
     lo, hi = mesh.bounds[0][idx], mesh.bounds[1][idx]
     span = hi - lo
 
+    # Scoped to this single compute_cut_planes call (one mesh, one axis):
+    # memoizes connectivity/section-area results across every refine_cut_planes
+    # and _planes_are_safe call made below, including every escalating attempt
+    # of the spacing-mode retry loop, which otherwise re-checks many identical
+    # or overlapping (lo, hi) slabs and coordinates.
+    connectivity_cache: dict[tuple, bool] = {}
+    area_cache: dict[tuple, float] = {}
+    max_workers = os.cpu_count() or 1
+    # Phase 6 (OPTIMIZATION_PLAN.md): a fast graph-based connectivity
+    # pre-filter, built once per (mesh, axis) and reused by every
+    # connectivity check below. Only ever used to trust a cheap "disconnected"
+    # answer outright (never a "connected" one — see
+    # `_is_single_component_prefiltered` for why), so it can only make checks
+    # faster, never change which planes are chosen.
+    graph_index = build_graph_connectivity_index(mesh, idx)
+
+    if executor is not None:
+        # Caller-owned pool: use it as-is, don't shut it down.
+        return _compute_cut_planes_inner(
+            mesh, idx, lo, hi, span, spacing, pieces, smart, executor, max_workers,
+            connectivity_cache, area_cache, graph_index, cancel_event,
+        )
+
     # A live process pool, reused across every refine_cut_planes/
     # _planes_are_safe call this function makes (all the spacing-mode
     # retry's escalating attempts included) — spawning it once here and
@@ -197,12 +254,15 @@ def compute_cut_planes(
     # the threshold, everything just runs serially as before (executor=None
     # is threaded through and behaves identically to before this existed).
     use_parallel = len(mesh.faces) >= _PARALLEL_FACE_THRESHOLD
-    executor = ProcessPoolExecutor(max_workers=os.cpu_count() or 1) if use_parallel else None
+    owned_executor = ProcessPoolExecutor(max_workers=max_workers) if use_parallel else None
     try:
-        return _compute_cut_planes_inner(mesh, idx, lo, hi, span, spacing, pieces, smart, executor)
+        return _compute_cut_planes_inner(
+            mesh, idx, lo, hi, span, spacing, pieces, smart, owned_executor, max_workers,
+            connectivity_cache, area_cache, graph_index, cancel_event,
+        )
     finally:
-        if executor is not None:
-            executor.shutdown(wait=True)
+        if owned_executor is not None:
+            owned_executor.shutdown(wait=True)
 
 
 def _compute_cut_planes_inner(
@@ -215,6 +275,11 @@ def _compute_cut_planes_inner(
     pieces: int | None,
     smart: bool,
     executor: "ProcessPoolExecutor | None",
+    max_workers: int,
+    connectivity_cache: dict[tuple, bool],
+    area_cache: dict[tuple, float],
+    graph_index: "GraphConnectivityIndex | None" = None,
+    cancel_event: "threading.Event | None" = None,
 ) -> list[float]:
     if pieces is not None:
         if pieces < 1:
@@ -229,7 +294,11 @@ def _compute_cut_planes_inner(
         # safe cut exists at this exact count, refine_cut_planes does its
         # best and cutting.py will raise a clear, actionable error.
         if smart and planes:
-            planes = refine_cut_planes(mesh, idx, planes, max_piece_size=None, executor=executor)
+            planes = refine_cut_planes(
+                mesh, idx, planes, max_piece_size=None, executor=executor, max_workers=max_workers,
+                connectivity_cache=connectivity_cache, area_cache=area_cache, graph_index=graph_index,
+                cancel_event=cancel_event,
+            )
         return planes
 
     if spacing <= 0:
@@ -263,14 +332,21 @@ def _compute_cut_planes_inner(
     max_extra_attempts = 5
     first_attempt = None
     for _ in range(max_extra_attempts + 1):
+        _check_cancelled(cancel_event)
         step = span / n_pieces
         planes = [lo + step * i for i in range(1, n_pieces)]
         if not smart or not planes:
             return planes
-        refined = refine_cut_planes(mesh, idx, planes, max_piece_size=spacing, executor=executor)
+        refined = refine_cut_planes(
+            mesh, idx, planes, max_piece_size=spacing, executor=executor, max_workers=max_workers,
+            connectivity_cache=connectivity_cache, area_cache=area_cache, graph_index=graph_index,
+            cancel_event=cancel_event,
+        )
         if first_attempt is None:
             first_attempt = refined
-        if _planes_are_safe(mesh, idx, refined, lo, hi, executor=executor):
+        if _planes_are_safe(
+            mesh, idx, refined, lo, hi, executor=executor, cache=connectivity_cache, graph_index=graph_index
+        ):
             return refined
         n_pieces += 1
     # Never found a fully safe configuration at any piece count tried — more
@@ -286,32 +362,54 @@ def _compute_cut_planes_inner(
     return first_attempt
 
 
-def _section_area(mesh: trimesh.Trimesh, axis_idx: int, coord: float) -> float:
+def _round_bound(x: float | None) -> float | None:
+    return None if x is None else round(x, 6)
+
+
+def _section_area(
+    mesh: trimesh.Trimesh, axis_idx: int, coord: float, cache: dict[tuple, float] | None = None
+) -> float:
     """Cross-sectional area of `mesh` at the plane axis_idx=coord (0 if the
-    plane misses the mesh entirely)."""
+    plane misses the mesh entirely). `cache`, if given, memoizes by
+    (axis_idx, rounded coord) — scoped to one compute_cut_planes call, where
+    the same coordinate is often re-scored across the retry loop and the
+    staged window-widening in refine_cut_planes."""
+    key = (axis_idx, round(coord, 6))
+    if cache is not None and key in cache:
+        return cache[key]
     normal = [0.0, 0.0, 0.0]
     normal[axis_idx] = 1.0
     origin = [0.0, 0.0, 0.0]
     origin[axis_idx] = coord
     section = mesh.section(plane_origin=origin, plane_normal=normal)
     if section is None:
-        return 0.0
-    try:
-        planar, _ = section.to_planar()
-    except Exception:
-        return 0.0
-    return float(planar.area)
+        area = 0.0
+    else:
+        try:
+            planar, _ = section.to_planar()
+            area = float(planar.area)
+        except Exception:
+            area = 0.0
+    if cache is not None:
+        cache[key] = area
+    return area
 
 
-def _neighborhood_area(mesh: trimesh.Trimesh, axis_idx: int, coord: float, probe: float) -> float:
+def _neighborhood_area(
+    mesh: trimesh.Trimesh,
+    axis_idx: int,
+    coord: float,
+    probe: float,
+    cache: dict[tuple, float] | None = None,
+) -> float:
     """Worst-case (minimum) cross-sectional area sampled at coord and just to
     either side of it. A single-point area can look fine while sitting right
     next to a near-zero pinch (a sliver); sampling a small neighborhood
     catches that."""
     return min(
-        _section_area(mesh, axis_idx, coord - probe),
-        _section_area(mesh, axis_idx, coord),
-        _section_area(mesh, axis_idx, coord + probe),
+        _section_area(mesh, axis_idx, coord - probe, cache),
+        _section_area(mesh, axis_idx, coord, cache),
+        _section_area(mesh, axis_idx, coord + probe, cache),
     )
 
 
@@ -345,8 +443,116 @@ def _is_single_component(mesh: trimesh.Trimesh, axis_idx: int, lo: float | None,
         return True  # don't block refinement on slicing edge cases
 
 
-def _is_single_component_worker(vertices, faces, axis_idx: int, lo: float | None, hi: float | None) -> bool:
-    """Worker body for `_batch_is_safe` below, run in a separate process.
+# Phase 6 (OPTIMIZATION_PLAN.md): an experimental, much faster approximation
+# of `_is_single_component` below, using precomputed face-adjacency
+# connectivity instead of slicing+capping+splitting. NOT used by
+# `refine_cut_planes`/`_planes_are_safe` yet — see the comparison harness in
+# `tests/verify_graph_connectivity.py`, which must show zero disagreement
+# against `_is_single_component` on real models before this can be trusted as
+# a drop-in replacement rather than a pre-filter.
+
+
+@dataclass(frozen=True)
+class GraphConnectivityIndex:
+    """Precomputed structures for `is_single_component_graph`, built once per
+    (mesh, axis) pair a single planning call works with — avoids recomputing
+    face adjacency/areas/per-face axis ranges on every candidate check."""
+
+    face_lo: np.ndarray
+    face_hi: np.ndarray
+    adjacency: np.ndarray
+    face_areas: np.ndarray
+
+
+def build_graph_connectivity_index(mesh: trimesh.Trimesh, axis_idx: int) -> GraphConnectivityIndex:
+    coords = mesh.vertices[mesh.faces][:, :, axis_idx]
+    return GraphConnectivityIndex(
+        face_lo=coords.min(axis=1),
+        face_hi=coords.max(axis=1),
+        adjacency=mesh.face_adjacency,
+        face_areas=mesh.area_faces,
+    )
+
+
+# Area-based proxy for "significant" component, standing in for
+# `_is_single_component`'s volume-based `FLOATING_REGION_MIN_VOLUME_MM3`
+# threshold — the graph check only has access to face area, not capped
+# solid volume, so this is a coarse proxy, not an exact equivalence. Whether
+# it tracks the volume-based threshold closely enough is exactly what the
+# comparison harness measures.
+GRAPH_FLOATING_REGION_MIN_AREA_MM2 = 1.0
+
+
+def is_single_component_graph(index: GraphConnectivityIndex, lo: float | None, hi: float | None) -> bool:
+    """Fast approximation of `_is_single_component`: whether the faces whose
+    axis-range overlaps `[lo, hi]` form a single connected component (via
+    face adjacency), ignoring any face-adjacency component too small to be a
+    real floating region. No slicing, no capping, no `split()` — just a
+    masked connected-components pass over a graph built once per planning
+    call."""
+    lo_bound = -np.inf if lo is None else lo
+    hi_bound = np.inf if hi is None else hi
+    mask = (index.face_hi >= lo_bound) & (index.face_lo <= hi_bound)
+    if not mask.any():
+        return False  # slab misses the mesh entirely
+
+    kept = np.nonzero(mask)[0]
+    remap = np.full(len(mask), -1, dtype=np.int64)
+    remap[kept] = np.arange(len(kept))
+
+    a, b = index.adjacency[:, 0], index.adjacency[:, 1]
+    edge_mask = mask[a] & mask[b]
+    if not edge_mask.any():
+        n_components = len(kept)
+        labels = np.arange(len(kept))
+    else:
+        a2, b2 = remap[a[edge_mask]], remap[b[edge_mask]]
+        graph = coo_matrix((np.ones(len(a2)), (a2, b2)), shape=(len(kept), len(kept)))
+        n_components, labels = connected_components(graph, directed=False)
+
+    if n_components <= 1:
+        return True
+    comp_area = np.bincount(labels, weights=index.face_areas[kept], minlength=n_components)
+    significant = int(np.count_nonzero(comp_area >= GRAPH_FLOATING_REGION_MIN_AREA_MM2))
+    return significant <= 1
+
+
+def _is_single_component_prefiltered(
+    mesh: trimesh.Trimesh,
+    axis_idx: int,
+    lo: float | None,
+    hi: float | None,
+    graph_index: "GraphConnectivityIndex | None",
+) -> bool:
+    """`_is_single_component`, optionally pre-filtered by the fast graph-based
+    approximation (Phase 6, OPTIMIZATION_PLAN.md). The comparison harness
+    (`tests/verify_graph_connectivity.py`) found the graph check's
+    disagreements are overwhelmingly one-directional: it can incorrectly
+    report "connected" for a slab that's actually empty/disconnected (a face
+    exactly tangent to the slab boundary gets counted as material present),
+    but essentially never incorrectly reports "disconnected" for a slab
+    that's actually safe. So only the "disconnected" answer is trusted
+    outright — it's cheap and safe to skip the real check on. A "connected"
+    answer is never trusted alone; it always falls through to the real,
+    authoritative `_is_single_component` check. This is the inverse of the
+    pre-filter direction the plan originally proposed ("trust connected,
+    verify disconnected") — that direction turned out to be the unsafe one
+    for this mesh/error profile, so it was flipped based on the measured
+    data rather than followed as originally written."""
+    if graph_index is not None and not is_single_component_graph(graph_index, lo, hi):
+        return False
+    return _is_single_component(mesh, axis_idx, lo, hi)
+
+
+def _is_single_component_worker(
+    vertices,
+    faces,
+    axis_idx: int,
+    lo: float | None,
+    hi: float | None,
+    graph_index: "GraphConnectivityIndex | None" = None,
+) -> bool:
+    """Worker body for `_planes_are_safe` below, run in a separate process.
     Takes plain vertex/face arrays rather than a `Trimesh` for the same
     reason as `pipeline._process_one_piece`: sidesteps whatever unpicklable
     cached state (a ray-query engine, etc.) a `Trimesh` may carry rather
@@ -361,7 +567,73 @@ def _is_single_component_worker(vertices, faces, axis_idx: int, lo: float | None
     was meant to avoid. Reverted; keep this simpler version unless a
     measurement says otherwise."""
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    return _is_single_component(mesh, axis_idx, lo, hi)
+    return _is_single_component_prefiltered(mesh, axis_idx, lo, hi, graph_index)
+
+
+def _connectivity_cache_lookup(
+    cache: dict[tuple, bool] | None, axis_idx: int, lo: float | None, hi: float | None
+) -> bool | None:
+    if cache is None:
+        return None
+    return cache.get((axis_idx, _round_bound(lo), _round_bound(hi)))
+
+
+def _connectivity_cache_store(
+    cache: dict[tuple, bool] | None, axis_idx: int, lo: float | None, hi: float | None, value: bool
+) -> None:
+    if cache is not None:
+        cache[(axis_idx, _round_bound(lo), _round_bound(hi))] = value
+
+
+def _is_single_component_cached(
+    mesh: trimesh.Trimesh,
+    axis_idx: int,
+    lo: float | None,
+    hi: float | None,
+    cache: dict[tuple, bool] | None = None,
+    graph_index: "GraphConnectivityIndex | None" = None,
+) -> bool:
+    cached = _connectivity_cache_lookup(cache, axis_idx, lo, hi)
+    if cached is not None:
+        return cached
+    result = _is_single_component_prefiltered(mesh, axis_idx, lo, hi, graph_index)
+    _connectivity_cache_store(cache, axis_idx, lo, hi, result)
+    return result
+
+
+def _candidates_chunk_worker(
+    vertices,
+    faces,
+    axis_idx: int,
+    left_bound: float,
+    right_bound: float,
+    chunk: list[float],
+    graph_index: "GraphConnectivityIndex | None" = None,
+) -> list[tuple[bool, bool | None]]:
+    """Worker body for `_batch_is_safe`'s parallel path, run in a separate
+    process. Checks a whole `chunk` of candidates in one call (so the mesh
+    is pickled to the worker once per chunk, not once per candidate — the
+    dominant cost on a heavy mesh, since vertices/faces can be tens of MB).
+    Returns one (left_safe, right_safe) pair per candidate in `chunk`, in
+    order; `right_safe` is None when `left_safe` was False, since the right
+    side is never checked in that case (short-circuits the same way the old
+    purely-sequential version did, just per-candidate instead of globally)."""
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    results = []
+    for c in chunk:
+        left_safe = _is_single_component_prefiltered(mesh, axis_idx, left_bound, c, graph_index)
+        right_safe = _is_single_component_prefiltered(mesh, axis_idx, c, right_bound, graph_index) if left_safe else None
+        results.append((left_safe, right_safe))
+    return results
+
+
+def _chunk_candidates(candidates: list[float], n_chunks: int) -> list[list[float]]:
+    """Split `candidates` into up to `n_chunks` contiguous chunks (fewer if
+    there aren't enough candidates), so a batch check submits one task per
+    worker instead of one per candidate."""
+    n_chunks = max(1, min(n_chunks, len(candidates)))
+    chunk_size = -(-len(candidates) // n_chunks)  # ceil division
+    return [candidates[i : i + chunk_size] for i in range(0, len(candidates), chunk_size)]
 
 
 def _batch_is_safe(
@@ -371,6 +643,9 @@ def _batch_is_safe(
     candidates: list[float],
     left_bound: float,
     right_bound: float,
+    max_workers: int = 1,
+    cache: dict[tuple, bool] | None = None,
+    graph_index: "GraphConnectivityIndex | None" = None,
 ) -> dict[float, bool]:
     """Check whether each `c` in `candidates` is a safe cut position (both
     [left_bound, c] and [c, right_bound] are single-component), for the
@@ -381,20 +656,54 @@ def _batch_is_safe(
     candidates concurrently instead of one at a time is the difference
     between a search that finishes in seconds and one that takes minutes.
     Falls back to plain sequential checks when no executor was handed in
-    (small/fast meshes — see `_PARALLEL_FACE_THRESHOLD`)."""
+    (small/fast meshes — see `_PARALLEL_FACE_THRESHOLD`).
+
+    `cache`, if given, memoizes individual (axis_idx, lo, hi) connectivity
+    results across the whole compute_cut_planes call this batch is part of
+    (see `_is_single_component_cached`) — a cache hit skips the check for
+    that side entirely, sequential or parallel."""
+    result: dict[float, bool] = {}
+    pending: list[float] = []
+    for c in candidates:
+        left_cached = _connectivity_cache_lookup(cache, axis_idx, left_bound, c)
+        if left_cached is False:
+            result[c] = False
+            continue
+        if left_cached is True:
+            right_cached = _connectivity_cache_lookup(cache, axis_idx, c, right_bound)
+            if right_cached is not None:
+                result[c] = right_cached
+                continue
+        pending.append(c)
+
+    if not pending:
+        return result
+
     if executor is None:
-        return {
-            c: _is_single_component(mesh, axis_idx, left_bound, c) and _is_single_component(mesh, axis_idx, c, right_bound)
-            for c in candidates
-        }
+        for c in pending:
+            safe = _is_single_component_cached(
+                mesh, axis_idx, left_bound, c, cache, graph_index
+            ) and _is_single_component_cached(mesh, axis_idx, c, right_bound, cache, graph_index)
+            result[c] = safe
+        return result
 
     vertices, faces = mesh.vertices, mesh.faces
-    futures = {}
-    for c in candidates:
-        futures[(c, "left")] = executor.submit(_is_single_component_worker, vertices, faces, axis_idx, left_bound, c)
-        futures[(c, "right")] = executor.submit(_is_single_component_worker, vertices, faces, axis_idx, c, right_bound)
-    results = {key: future.result() for key, future in futures.items()}
-    return {c: results[(c, "left")] and results[(c, "right")] for c in candidates}
+    chunks = _chunk_candidates(pending, max_workers)
+    futures = [
+        executor.submit(
+            _candidates_chunk_worker, vertices, faces, axis_idx, left_bound, right_bound, chunk, graph_index
+        )
+        for chunk in chunks
+    ]
+    for chunk, future in zip(chunks, futures):
+        for c, (left_safe, right_safe) in zip(chunk, future.result()):
+            _connectivity_cache_store(cache, axis_idx, left_bound, c, left_safe)
+            if right_safe is not None:
+                _connectivity_cache_store(cache, axis_idx, c, right_bound, right_safe)
+                result[c] = left_safe and right_safe
+            else:
+                result[c] = False
+    return result
 
 
 def _planes_are_safe(
@@ -404,21 +713,44 @@ def _planes_are_safe(
     lo: float,
     hi: float,
     executor: "ProcessPoolExecutor | None" = None,
+    cache: dict[tuple, bool] | None = None,
+    graph_index: "GraphConnectivityIndex | None" = None,
 ) -> bool:
     """Whether every slab between consecutive `planes` (and the mesh's own
     bounds) is connectivity-safe, i.e. `refine_cut_planes` found a genuinely
     safe spot for every cut rather than falling back to its best-effort
     (possibly unsafe) candidate. Checks every slab boundary concurrently via
-    `executor` when one was given, rather than one at a time."""
+    `executor` when one was given, rather than one at a time. `cache`, if
+    given, skips slab boundaries already answered elsewhere in the same
+    compute_cut_planes call (e.g. by `refine_cut_planes` itself)."""
     bounds = [lo, *sorted(planes), hi]
-    if executor is None:
-        return all(_is_single_component(mesh, axis_idx, bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1))
-    vertices, faces = mesh.vertices, mesh.faces
-    futures = [
-        executor.submit(_is_single_component_worker, vertices, faces, axis_idx, bounds[i], bounds[i + 1])
-        for i in range(len(bounds) - 1)
-    ]
-    return all(f.result() for f in futures)
+    pairs = [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)]
+
+    result: dict[tuple, bool] = {}
+    pending = []
+    for pair in pairs:
+        cached = _connectivity_cache_lookup(cache, axis_idx, pair[0], pair[1])
+        if cached is not None:
+            result[pair] = cached
+        else:
+            pending.append(pair)
+
+    if pending:
+        if executor is None:
+            for pair in pending:
+                result[pair] = _is_single_component_cached(mesh, axis_idx, pair[0], pair[1], cache, graph_index)
+        else:
+            vertices, faces = mesh.vertices, mesh.faces
+            futures = [
+                executor.submit(_is_single_component_worker, vertices, faces, axis_idx, a, b, graph_index)
+                for a, b in pending
+            ]
+            for pair, future in zip(pending, futures):
+                value = future.result()
+                _connectivity_cache_store(cache, axis_idx, pair[0], pair[1], value)
+                result[pair] = value
+
+    return all(result[pair] for pair in pairs)
 
 
 def refine_cut_planes(
@@ -431,6 +763,11 @@ def refine_cut_planes(
     improvement_ratio: float = 1.1,
     max_piece_size: float | None = None,
     executor: "ProcessPoolExecutor | None" = None,
+    max_workers: int = 1,
+    connectivity_cache: dict[tuple, bool] | None = None,
+    area_cache: dict[tuple, float] | None = None,
+    graph_index: "GraphConnectivityIndex | None" = None,
+    cancel_event: "threading.Event | None" = None,
 ) -> list[float]:
     """Nudge each plane within a bounded local window to sit at a larger,
     connectivity-safe cross-section, avoiding thin necks/slivers and the
@@ -449,14 +786,43 @@ def refine_cut_planes(
     whole batch of candidates' connectivity-safety concurrently instead of
     one at a time (see `_batch_is_safe`) — pass one in for heavy meshes
     where each check is itself expensive; `compute_cut_planes` decides when
-    that's worth it and owns the executor's lifetime.
+    that's worth it and owns the executor's lifetime. `max_workers` controls
+    how many chunks a batch is split into when `executor` is given.
+    `connectivity_cache`/`area_cache`, if given, memoize connectivity and
+    section-area results by (axis_idx, coord) across every call sharing the
+    same dicts — scope them to one compute_cut_planes call (the mesh doesn't
+    change within it), not across different meshes.
     """
     lo, hi = mesh.bounds[0][axis_idx], mesh.bounds[1][axis_idx]
     bounds = [lo, *sorted(planes), hi]
     refined: list[float] = []
     for i, p in enumerate(sorted(planes)):
-        left_bound, right_bound = bounds[i], bounds[i + 2]
-        gap = min(p - left_bound, right_bound - p)
+        _check_cancelled(cancel_event)
+        # left_bound must be the PREVIOUS plane's actual chosen position, not
+        # its original (pre-refinement) slot in `bounds` -- each plane is
+        # otherwise scored against where its neighbors *started*, not where
+        # they actually end up, and since every plane searches independently,
+        # two adjacent planes can each get nudged toward the other's original
+        # spot and cross over. That inverts their order (plane i+1 ends up
+        # left of plane i) and produces a near-zero-thickness sliver between
+        # them once sorted back for cutting -- exactly the "very thin Z
+        # layers" bug this guards against. right_bound is deliberately left
+        # as the original two-planes-ahead position (unchanged): that's the
+        # intentional wide look-ahead that lets a plane route around a pinch
+        # using a neighbor's original slot, and remains safe as an upper
+        # bound only, since the next iteration's left_bound is now pinned to
+        # THIS plane's real chosen position regardless of how far right it
+        # moved.
+        left_bound = max(bounds[i], refined[-1]) if refined else bounds[i]
+        right_bound = bounds[i + 2]
+        # `p` (this plane's original, pre-refinement position) can now sit
+        # to the left of `left_bound` if the previous plane got nudged past
+        # it -- clamp before using it to center the search window/gap below,
+        # so a pathologically squeezed previous plane can't produce a
+        # negative gap here (which would otherwise invert full_min_c/
+        # full_max_c and reopen the crossing bug this guards against).
+        p_clamped = min(max(p, left_bound), right_bound)
+        gap = min(p_clamped - left_bound, right_bound - p_clamped)
         min_gap = gap * min_gap_frac
         probe = max(gap * 0.02, 1e-3)
 
@@ -475,17 +841,18 @@ def refine_cut_planes(
             full_min_c = max(full_min_c, right_bound - max_piece_size)
             full_max_c = min(full_max_c, left_bound + max_piece_size)
         if full_max_c < full_min_c:
-            full_min_c = full_max_c = p
+            full_min_c = full_max_c = p_clamped
 
-        chosen = p
+        chosen = p_clamped
         # Widen the search in stages: try a small band around p first so
         # symmetric spacing is preserved when nothing's wrong, then expand
         # toward the full allowed range only if that wasn't enough to find
         # a safe spot.
         for frac in (search_frac, search_frac * 3, 1.0):
+            _check_cancelled(cancel_event)
             half_width = gap * frac
-            lo_c = max(full_min_c, p - half_width)
-            hi_c = min(full_max_c, p + half_width)
+            lo_c = max(full_min_c, p_clamped - half_width)
+            hi_c = min(full_max_c, p_clamped + half_width)
             if hi_c <= lo_c:
                 if frac >= 1.0:
                     lo_c, hi_c = full_min_c, full_max_c
@@ -493,11 +860,11 @@ def refine_cut_planes(
                     continue
 
             candidates = list(np.linspace(lo_c, hi_c, samples))
-            if p not in candidates:
-                candidates.append(p)
+            if p_clamped not in candidates:
+                candidates.append(p_clamped)
 
             scored = sorted(
-                ((c, _neighborhood_area(mesh, axis_idx, c, probe)) for c in candidates),
+                ((c, _neighborhood_area(mesh, axis_idx, c, probe, area_cache)) for c in candidates),
                 key=lambda t: t[1],
                 reverse=True,
             )
@@ -517,8 +884,11 @@ def refine_cut_planes(
             # candidate, or top-K-by-area fallback) is identical to the old
             # purely-sequential early-exit version, just not serialized.
             near_best = [c for c, a in scored if max_area <= 0 or a >= max_area / improvement_ratio]
-            near_best_by_proximity = sorted(near_best, key=lambda c: abs(c - p))
-            safety = _batch_is_safe(executor, mesh, axis_idx, near_best_by_proximity, left_bound, right_bound)
+            near_best_by_proximity = sorted(near_best, key=lambda c: abs(c - p_clamped))
+            safety = _batch_is_safe(
+                executor, mesh, axis_idx, near_best_by_proximity, left_bound, right_bound,
+                max_workers=max_workers, cache=connectivity_cache, graph_index=graph_index,
+            )
             found = False
             for c in near_best_by_proximity:
                 if safety[c]:
@@ -535,7 +905,10 @@ def refine_cut_planes(
             # made this pathologically slow on large/complex meshes.
             _TOP_K_FALLBACK = 6
             fallback_candidates = [c for c, _a in scored[:_TOP_K_FALLBACK]]
-            fallback_safety = _batch_is_safe(executor, mesh, axis_idx, fallback_candidates, left_bound, right_bound)
+            fallback_safety = _batch_is_safe(
+                executor, mesh, axis_idx, fallback_candidates, left_bound, right_bound,
+                max_workers=max_workers, cache=connectivity_cache, graph_index=graph_index,
+            )
             for c in fallback_candidates:
                 if fallback_safety[c]:
                     chosen = c

@@ -34,6 +34,15 @@ class ProgressReporter:
         self._done = 0
         self._cancel_event = cancel_event
 
+    @property
+    def cancel_event(self) -> "threading.Event | None":
+        """Exposed so long-running computations that don't go through
+        `step()` (e.g. `geometry.compute_cut_planes`'s search loop) can still
+        check the same cancellation signal directly, rather than only
+        finding out at the next `step()` call after they've already
+        returned."""
+        return self._cancel_event
+
     def set_total(self, total: int) -> None:
         self._total = max(total, 1)
 

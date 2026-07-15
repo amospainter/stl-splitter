@@ -15,7 +15,7 @@ export const PRESET_FIELDS = [
   "peg_diameter", "peg_length", "peg_clearance", "n_pegs", "min_wall_thickness",
   "dowel_shape", "alignment_key", "no_connectors",
   "hollow_wall",
-  "allow_non_watertight", "format", "bed_size",
+  "allow_non_watertight", "allow_floating_regions", "format", "bed_size",
 ];
 
 function readAll() {

@@ -1,19 +1,30 @@
-Traceback (most recent call last):
-  File "D:\code\stl-splitter\tests\bench_split.py", line 55, in <module>
-    main()
-  File "D:\code\stl-splitter\tests\bench_split.py", line 44, in main
-    _report(
-  File "D:\code\stl-splitter\tests\bench_split.py", line 29, in _report
-    pieces, dowels = run_pipeline(mesh, params)
-                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "D:\code\stl-splitter\stlsplit\pipeline.py", line 283, in run_pipeline
-    pieces = _cut_mesh_or_raise(mesh, resolved, params.axis, progress)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "D:\code\stl-splitter\stlsplit\pipeline.py", line 29, in _cut_mesh_or_raise
-    return cut_mesh(mesh, resolved, progress=progress)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "D:\code\stl-splitter\stlsplit\cutting.py", line 69, in cut_mesh
-    _check_no_floating_regions(piece, i)
-  File "D:\code\stl-splitter\stlsplit\cutting.py", line 37, in _check_no_floating_regions
-    raise CutPlacementError(
-stlsplit.geometry.CutPlacementError: Piece 2 split into 2 disconnected regions instead of one solid — a cut plane landed where the model pinches to nothing. (axis z, cut position 78.38mm or 121.81mm) Try moving that cut, changing its tilt, or picking a different axis.
+=== standing_figure.stl load check ===
+faces=2964 watertight=True extents=[ 56.          35.91607666 184.        ]
+
+=== capsule pieces=4 (axis=z) ===
+elapsed: 12.3709s
+pieces: 4  dowels: 12
+  piece 0: volume=50489.896 faces=26118 watertight=True
+  piece 1: volume=58059.916 faces=1676 watertight=True
+  piece 2: volume=58059.916 faces=1676 watertight=True
+  piece 3: volume=50489.896 faces=26118 watertight=True
+
+=== capsule spacing (axis=z, ~1/3 z-extent) ===
+elapsed: 17.3021s
+pieces: 3  dowels: 8
+  piece 0: volume=70379.595 faces=26118 watertight=True
+  piece 1: volume=77949.613 faces=1676 watertight=True
+  piece 2: volume=70379.595 faces=26118 watertight=True
+
+=== capsule pieces=8 (axis=z, no connectors) ===
+elapsed: 16.0348s
+pieces: 8  dowels: 0
+  piece 0: volume=21459.938 faces=25598 watertight=True
+  piece 1: volume=29834.548 faces=636 watertight=True
+  piece 2: volume=29834.548 faces=636 watertight=True
+  piece 3: volume=29834.548 faces=636 watertight=True
+  piece 4: volume=29834.548 faces=636 watertight=True
+  piece 5: volume=29834.548 faces=636 watertight=True
+  piece 6: volume=29834.548 faces=636 watertight=True
+  piece 7: volume=21459.938 faces=25598 watertight=True
+

@@ -4,7 +4,7 @@
 // properties and have the DOM update itself, instead of manually re-rendering
 // on every change.
 import { reactive, computed, watch } from "vue";
-import { startJob, streamJob, cancelJob, planePreview } from "./api.js";
+import { startJob, streamJob, cancelJob, planePreview, cancelPlanePreview } from "./api.js";
 import { AXIS_INDEX } from "./viewer.js";
 import { PRESET_FIELDS } from "./presets.js";
 
@@ -35,6 +35,12 @@ function makeAxisController(axisName, form) {
   // settling once. Each fetch stamps a token; only the fetch that's still
   // the *latest* one issued is allowed to apply its result.
   let requestToken = 0;
+  // The server-side preview_id of whichever /plane_preview request is
+  // currently in flight for this axis, if any — lets a newer request (the
+  // user kept typing) or an explicit Stop click actually cancel the
+  // still-running backend computation, rather than only ever discarding
+  // its eventual, wasted result once it finishes on its own.
+  let inFlightPreviewId = null;
 
   // Bed X/Y/Z used to switch this axis into a separate, non-editable
   // recursive auto-fit mode entirely (see autofit.py — it re-checks each
@@ -126,6 +132,15 @@ function makeAxisController(axisName, form) {
       return;
     }
 
+    // A still-running previous request for this axis is about to be
+    // superseded — actually stop its backend computation instead of just
+    // letting it burn CPU in the background until it finishes on its own
+    // (its result would be discarded anyway via the requestToken check
+    // below). Best-effort/fire-and-forget: nothing here needs to wait for it.
+    if (inFlightPreviewId) cancelPlanePreview(inFlightPreviewId);
+    const previewId = `${axisName}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    inFlightPreviewId = previewId;
+
     const fd = new FormData();
     fd.set("file", form.file);
     fd.set("axis", axisName);
@@ -134,11 +149,12 @@ function makeAxisController(axisName, form) {
     fd.set("target_dim", form.target_dim);
     fd.set("spacing", spacingVal);
     fd.set("pieces", piecesVal);
+    fd.set("preview_id", previewId);
 
     // A pinch-avoiding safety search on a large/complex mesh can take
     // genuinely long (tens of seconds) — surfaced in the UI (see the
-    // "computing…" hint in AxisPlaneEditor) so a slow response reads as
-    // "still working" rather than "broken".
+    // "computing…" hint and Stop button in AxisPlaneEditor) so a slow
+    // response reads as "still working, and stoppable" rather than "broken".
     const myToken = ++requestToken;
     state.loading = true;
     let data;
@@ -148,12 +164,16 @@ function makeAxisController(axisName, form) {
       return; // leave whatever was on screen; a transient preview failure isn't worth surfacing loudly
     } finally {
       if (myToken === requestToken) state.loading = false;
+      if (inFlightPreviewId === previewId) inFlightPreviewId = null;
     }
 
     // A newer request has since been issued (e.g. the user kept typing) —
     // drop this now-stale result instead of letting it overwrite whatever
-    // the latest in-flight/completed request already produced.
-    if (myToken !== requestToken) return;
+    // the latest in-flight/completed request already produced. Same for a
+    // result that only came back because it was cancelled (either by a
+    // newer request above, or by the user's own Stop click): there's
+    // nothing new to apply, just leave the screen as it was.
+    if (myToken !== requestToken || data.cancelled) return;
 
     // Only let the server's auto-computed planes replace what's on screen
     // when spacing/pieces actually asked for a count; otherwise (manual
@@ -167,12 +187,20 @@ function makeAxisController(axisName, form) {
     form.scaleFactor = data.scale_factor;
   }
 
+  // Lets the user explicitly stop a long-running auto-placement
+  // computation from the UI (the Stop button next to the "computing…"
+  // spinner in AxisPlaneEditor), rather than only being able to wait it out
+  // or supersede it by changing another field.
+  function stopPreview() {
+    if (inFlightPreviewId) cancelPlanePreview(inFlightPreviewId);
+  }
+
   function schedulePreview() {
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(fetchPreview, 350);
   }
 
-  return { name: axisName, state, fit, serialize, addCut, removeCut, clearErrors, highlightErrors, fetchPreview, schedulePreview };
+  return { name: axisName, state, fit, serialize, addCut, removeCut, clearErrors, highlightErrors, fetchPreview, schedulePreview, stopPreview };
 }
 
 export function useSplitForm() {
@@ -196,6 +224,7 @@ export function useSplitForm() {
     hollow_wall: "",
 
     allow_non_watertight: false,
+    allow_floating_regions: false,
     format: "stl",
     bed_size: "256",
   });
@@ -261,7 +290,8 @@ export function useSplitForm() {
       peg_diameter: form.peg_diameter, peg_length: form.peg_length, peg_clearance: form.peg_clearance,
       n_pegs: form.n_pegs, min_wall_thickness: form.min_wall_thickness, alignment_key: form.alignment_key,
       dowel_shape: form.dowel_shape, no_connectors: form.no_connectors, hollow_wall: form.hollow_wall,
-      allow_non_watertight: form.allow_non_watertight, format: form.format, bed_size: form.bed_size,
+      allow_non_watertight: form.allow_non_watertight, allow_floating_regions: form.allow_floating_regions,
+      format: form.format, bed_size: form.bed_size,
     });
   }
 
@@ -303,6 +333,7 @@ export function useSplitForm() {
     fd.set("no_connectors", form.no_connectors ? "true" : "false");
     fd.set("hollow_wall", form.hollow_wall);
     fd.set("allow_non_watertight", form.allow_non_watertight ? "true" : "false");
+    fd.set("allow_floating_regions", form.allow_floating_regions ? "true" : "false");
     fd.set("format", form.format);
     fd.set("bed_size", form.bed_size);
     return fd;

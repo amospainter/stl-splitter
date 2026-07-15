@@ -7,6 +7,8 @@ last and as its own change. Each phase is independent — complete and verify on
 phase fully (including running tests) before starting the next. Do NOT combine
 phases into one change.
 
+**Progress: Phases 0–7 all DONE.**
+
 Environment notes:
 - Use the project venv: `.venv\Scripts\python.exe` (Windows).
 - Run tests with: `.venv\Scripts\python.exe -m pytest tests/ -x -q`
@@ -17,7 +19,15 @@ Environment notes:
 
 ---
 
-## Phase 0 — Benchmark + behavior-lock harness (do this first)
+## Phase 0 — Benchmark + behavior-lock harness (do this first) [DONE]
+
+**Result:** `tests/bench_split.py` added; `tests/bench_baseline.txt` committed.
+`standing_figure.stl` turned out to raise `CutPlacementError` on every axis/piece
+count tried (its splayed limbs make no axis-aligned cut connectivity-safe) — it is
+used only as a load/watertight smoke check. The actual perf/behavior-lock
+benchmark uses a synthetic `trimesh.creation.capsule(radius=20, height=150,
+count=[160,160])` mesh (~50k faces, above `_PARALLEL_FACE_THRESHOLD`, safe to cut
+at any piece count on its long axis).
 
 **Goal:** Make every later phase measurable and prove behavior didn't change.
 
@@ -41,7 +51,15 @@ piece counts/topology are NOT).
 
 ---
 
-## Phase 1 — Replace box-boolean cutting with progressive plane splitting (BIGGEST WIN)
+## Phase 1 — Replace box-boolean cutting with progressive plane splitting (BIGGEST WIN) [DONE]
+
+**Result:** Implemented as planned in `stlsplit/cutting.py`. Confirmed empirically
+that `split_by_plane`'s first return element is the +normal side, second is the
+-normal side. Bench: bit-identical piece/dowel counts, volumes, and face counts vs.
+baseline; total cutting time on the capsule benchmark dropped from ~45.7s to
+~29.1s (~36% faster). Manually verified a tilted cut (`Cut(tilt_a=15)`) still
+produces two watertight pieces with exactly conserved volume. All 17 existing
+tests pass unchanged.
 
 **Problem:** `cut_mesh` in `stlsplit/cutting.py` produces each of N pieces by
 boolean-intersecting the FULL original mesh against 1–2 giant box meshes
@@ -140,7 +158,15 @@ checks must be preserved exactly, including the error text pattern
 
 ---
 
-## Phase 2 — Halve IPC cost in `_batch_is_safe` (geometry.py)
+## Phase 2 — Halve IPC cost in `_batch_is_safe` (geometry.py) [DONE]
+
+**Result:** Implemented as one task per candidate (combined left+right check with
+short-circuit) plus contiguous chunking across `max_workers` so the mesh is pickled
+once per chunk, not once per candidate/side. Implemented together with Phase 3
+(same functions needed both changes) — see that phase's result note for combined
+verification. `_is_single_component_worker` was kept (still used by
+`_planes_are_safe`, which stayed one-task-per-boundary since that list is already
+small).
 
 **Problem:** `_batch_is_safe` in `stlsplit/geometry.py` submits TWO futures per
 candidate, and every single future pickles the full `vertices`/`faces` arrays to a
@@ -194,7 +220,19 @@ run on the same candidates). Time `compute_cut_planes` on `standing_figure.stl`
 
 ---
 
-## Phase 3 — Cache repeated slab-connectivity and section-area checks (geometry.py)
+## Phase 3 — Cache repeated slab-connectivity and section-area checks (geometry.py) [DONE]
+
+**Result:** Implemented as planned: `connectivity_cache`/`area_cache` dicts created
+once per `compute_cut_planes` call and threaded through `refine_cut_planes`,
+`_planes_are_safe`, `_batch_is_safe`, `_neighborhood_area`/`_section_area`, keyed by
+`(axis_idx, round(coord, 6))` (or `(lo, hi)` pair for connectivity). Verified with
+call-count instrumentation on the dumbbell mesh's unsafe-retry scenario
+(`compute_cut_planes(dumbbell, "y", spacing=8.0)`, which exercises the full
+5-extra-attempt retry loop): `mesh.section()` calls dropped from 2727 → 1253 (-54%)
+and `_is_single_component` calls from 1401 → 557 (-60%), with the exact same
+returned `planes` both before and after. Full suite (17 tests, including the
+serial-vs-parallel-parity and no-over-fragmentation regression tests) passes
+unchanged; bench output (Phase 0) bit-identical.
 
 **Problem A:** The spacing-mode retry loop in `_compute_cut_planes_inner` calls
 `refine_cut_planes` then `_planes_are_safe` per attempt, and consecutive attempts
@@ -233,7 +271,16 @@ temporary counter print while verifying, then remove it.
 
 ---
 
-## Phase 4 — Vectorize 2D candidate sampling in connectors (small, safe win)
+## Phase 4 — Vectorize 2D candidate sampling in connectors (small, safe win) [DONE]
+
+**Result:** Implemented as planned in `stlsplit/connectors.py`: `np.meshgrid(...,
+indexing="ij")` + `.ravel()` reproduces the old `for x in xs: for y in ys:` order
+exactly, and `shapely.contains_xy` / `shapely.distance` replace the per-point
+`Point(...)`/`.contains()`/`.boundary.distance()` calls. Verified candidate-order
+and value equivalence directly against the old nested-loop implementation on an
+L-shaped polygon (bit-exact match, same length, same order). Removed the
+now-unused `Point` import. Full suite (17 tests) passes unchanged; bench output
+bit-identical to Phase 0 baseline.
 
 **Problem:** `_candidate_positions_2d` in `stlsplit/connectors.py` tests up to
 48×48 = 2304 grid points one at a time with `safe_zone.contains(Point(x, y))` plus a
@@ -266,7 +313,20 @@ remove the print).
 
 ---
 
-## Phase 5 — Reuse one process pool across the auto-fit recursion (autofit.py)
+## Phase 5 — Reuse one process pool across the auto-fit recursion (autofit.py) [DONE]
+
+**Result:** Implemented as planned. `compute_cut_planes` now accepts an optional
+`executor` param — when given, it's used as-is and never shut down by
+`compute_cut_planes` (caller-owned lifetime); when omitted, behavior is unchanged
+(creates and tears down its own pool per call). `auto_fit_split` creates one pool
+up front (only when the top-level mesh is heavy enough to warrant it) and passes it
+through every `_split_recursive` level. Verified with a forced-parallel stress test
+(`geo._PARALLEL_FACE_THRESHOLD = 0`, multi-level auto-fit split of the capsule mesh
+into 16 pieces across 2 axes): reused-pool version took 9.2s vs. 74.7s for a
+simulated fresh-pool-per-call version (~8x faster), with identical piece count (16),
+full watertightness, and exact volume conservation in both. Full suite (17 tests)
+passes unchanged; bench output bit-identical (bench doesn't exercise autofit, as
+expected).
 
 **Problem:** `_split_recursive` in `stlsplit/autofit.py` calls
 `compute_cut_planes` once per oversized piece, and for every heavy piece that call
@@ -304,7 +364,12 @@ wall-clock lower on multi-level splits.
 
 ---
 
-## Phase 6 (OPTIONAL / higher risk — get maintainer sign-off before starting) —
+## Phase 6 (OPTIONAL / higher risk — get maintainer sign-off before starting) — [DONE]
+
+**Result:** Implemented as an *additive* pre-filter, not a swap-in replacement —
+the required validation step found nonzero disagreement, so per the plan's own
+rule the slice-based check remains authoritative. Full details below.
+
 ## Graph-based slab connectivity check
 
 **Problem:** `_is_single_component` does `slice_plane(cap=True)` (twice) plus a full
@@ -336,13 +401,124 @@ disagreement is zero on those models; otherwise keep the graph check as a fast
 pre-filter (graph says "connected" → trust it; graph says "disconnected" → confirm
 with the existing slice-based check).
 
+**What was actually built:** `geometry.build_graph_connectivity_index` /
+`geometry.is_single_component_graph`, implemented essentially as designed above
+(`mesh.face_adjacency` + per-face axis-range overlap + `connected_components`,
+with component significance approximated by summed face area,
+`GRAPH_FLOATING_REGION_MIN_AREA_MM2 = 1.0`, standing in for the volume threshold).
+
+**Validation harness:** `tests/verify_graph_connectivity.py` — instruments the real
+`_is_single_component` to log every `(axis_idx, lo, hi)` triple queried during real
+`compute_cut_planes` calls (pieces=2..5 and 3 spacings, all 3 axes) on four models:
+a synthetic box (standing in for the missing `stlsplit/static/box.stl`), the
+dumbbell fixture, the L-shaped-prism fixture, and `standing_figure.stl`. Each logged
+slab is then re-checked with the graph version and compared.
+
+**Result: nonzero disagreement (47 of 10,319 slabs, ~0.46%)** — box and L-shaped
+prism had zero disagreements; all 47 came from the dumbbell (46) and one from
+`standing_figure.stl`. Per the plan's own rule, this rules out swapping the graph
+check in as the sole/authoritative implementation.
+
+**Critical finding that changed the pre-filter design:** the disagreements are
+overwhelmingly *one-directional*. 46 of 47 are the graph check reporting
+"connected" (safe) when the real check says "disconnected" (unsafe) — root cause
+confirmed directly: a face lying exactly tangent to the slab boundary (e.g. a
+lobe's own flat cap face sitting exactly at `lo`) gets counted as "material
+present in the slab" by the inclusive `>=`/`<=` overlap test, even though the real
+slice+cap+split check correctly finds zero volume there. Only 1 of 47 goes the
+other way (graph says "disconnected" when real says "connected" — conservative,
+not dangerous). This means the plan's own literally-proposed pre-filter direction
+("trust connected, verify disconnected") is backwards for this error profile — it
+would launder exactly the 46 dangerous false-positives straight into production.
+The pre-filter actually implemented is the *inverse*: trust the graph check only
+when it says "disconnected" (skip the expensive check, cheap and safe per the
+data); never trust "connected" alone — always fall through to the real, slice-based
+`_is_single_component` in that case. See `geometry._is_single_component_prefiltered`
+for the implementation and this reasoning in context.
+
+**Correctness verification:** ran `compute_cut_planes` on the dumbbell and
+`standing_figure.stl`, all 3 axes, multiple piece counts and spacings (30
+scenarios), once with the pre-filter wired in and once on the pre-Phase-6 code (via
+`git stash`) — **zero differences** in the returned plane positions. This confirms
+the pre-filter is a pure speed optimization; it cannot change which cuts get chosen
+(it only ever substitutes a cheap "no" for what the real check would have said
+anyway, per the data above).
+
+**Performance:** timed the worst-case scenario the whole Phase 2/3/6 effort
+targets — the dumbbell's spacing-mode retry loop (`compute_cut_planes(dumbbell,
+"y", spacing=8.0)`, which is unsafe at every piece count and burns through all 5
+retry attempts): ~9.9s/run before this pre-filter vs. ~2.3s/run after — about
+**4.3x faster**, on top of the Phase 2/3 wins already measured earlier.
+
+**Wiring:** `graph_index` (built once per `(mesh, axis)` in `compute_cut_planes`)
+threads through `_compute_cut_planes_inner` → `refine_cut_planes` /
+`_planes_are_safe` → `_batch_is_safe` → `_is_single_component_cached` /
+`_candidates_chunk_worker` / `_is_single_component_worker`, reaching both the
+serial and parallel (`ProcessPoolExecutor`) paths — the `GraphConnectivityIndex`
+dataclass (plain numpy arrays) is directly picklable, so it's passed to worker
+processes the same way `vertices`/`faces` already were.
+
+Full suite (18 tests) passes unchanged; bench output (Phase 0) bit-identical.
+
 ---
 
 ## Phase 7 (CORRECTNESS FIX, not an optimization — do LAST, after all other phases,
 ## and get maintainer sign-off first) — Connectors placed before later cuts can be
-## sliced through
+## sliced through [DONE]
 
-**Problem:** Both multi-axis paths add connectors too early:
+**Result:** Implemented largely as planned, with one structural difference: the
+dedup (`_dedupe_cuts`) and second-stage connector application
+(`_add_connectors_after_cuts`) logic was placed in `stlsplit/connectors.py`
+(public `dedupe_cuts` / `add_connectors_after_cuts`) rather than `pipeline.py`,
+since `autofit.py` needed the same logic and `pipeline.py` already imports
+`autofit.auto_fit_split` — putting it in `pipeline.py` would have created a
+circular import. `add_connectors_at_interface` (the per-interface extraction) and
+`find_facing_pairs` (piece-pairing across a shared plane via cross-section polygon
+overlap) live in `connectors.py` as planned.
+
+One assumption was verified empirically before relying on it (not just asserted):
+that `_interface_polygon`'s local 2D (x, y) frame from `section.to_2D()` is
+consistent across independent calls with the same `(origin, normal)` regardless of
+which piece or `inward_sign` produced the section — confirmed on an asymmetric
+L-shaped cross-section (rotation and in-plane translation identical between two
+separate calls; only the out-of-plane sampling offset differed), which is what
+makes intersecting two different pieces' interface polygons meaningful.
+
+**Verification, not just "tests pass":** Built a standalone script reproducing the
+box/2x2 scenario and measuring each dowel's distance to both cut planes. Ran it
+against the OLD (pre-Phase-7) code via `git stash` and found a real violation: one
+dowel had `own_dist=0.00, other_dist=0.00` — its center sat exactly on the
+intersection of both cut planes, because the z-interface connector pass placed it
+before the x-cut existed. The same check against the NEW code shows every dowel
+keeping >= 8.6mm from the perpendicular plane (default inset is 8mm). This
+concrete before/after comparison is now a permanent regression test:
+`test_multi_axis_connectors_placed_after_all_cuts_not_between_axes` in
+`tests/test_pipeline.py`, asserting every dowel's distance to the *other* cut
+plane is >= `inset - 1mm` tolerance.
+
+Also end-to-end verified the `autofit.py` path (deferred connectors + shared pool
+reuse from Phase 5 composing correctly): a 300x300x60 box auto-fit split against a
+220mm bed produces 4 watertight pieces with 16 dowels, all bed constraints
+satisfied.
+
+Full suite now 18 tests (17 original + the new regression test), all passing.
+Single-axis bench output (Phase 0) unaffected, as expected — Phase 7 only touches
+the multi-axis (`_cut_all_axes`) and auto-fit (`_split_recursive`) paths.
+
+**Known limitation (accepted, not fixed):** `dedupe_cuts` merges cuts by
+parallel-normal + matching-offset tolerance. For axis-aligned cuts (the common
+case) this is exact, since normal is one-hot and the plane offset is just the cut
+position, independent of piece-specific origin. For *tilted* cuts applied in
+multi-axis mode, `ResolvedCut.origin`'s non-cut-axis components come from each
+sub-piece's own bounding-box center, which can differ slightly per piece — so in
+principle two recordings of "the same" tilted multi-axis cut could compute
+marginally different offsets and fail to merge. This is a pre-existing quirk of
+`resolve_cuts`'s origin computation (predates Phase 7), not something Phase 7
+introduced; the practical effect if it occurs is a missed connector-placement
+opportunity (safe), never an incorrect one.
+
+**Problem (original bug this fixes):** Both multi-axis paths add connectors too
+early:
 
 - `stlsplit/autofit.py` `_split_recursive`: cuts on one axis, subtracts sockets at
   those interfaces, THEN recursively cuts the resulting pieces on other axes.

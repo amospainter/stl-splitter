@@ -71,6 +71,15 @@ class Job:
 _JOBS: dict[str, Job] = {}
 _JOBS_LOCK = threading.Lock()
 
+# Cancellation registry for in-flight /plane_preview computations (the
+# per-axis "auto-placed cut planes" search that runs live as the user edits
+# spacing/piece-count/bed-size fields). Keyed by a client-generated
+# `preview_id` (one per axis's debounced request, not a stable per-axis key)
+# rather than a Job-style dataclass, since a preview has no other state to
+# track — just whether cancellation was requested before it finished.
+_PREVIEW_CANCEL_EVENTS: dict[str, threading.Event] = {}
+_PREVIEW_CANCEL_LOCK = threading.Lock()
+
 
 _INDEX_HTML = """<!doctype html>
 <html data-bs-theme="dark">
@@ -145,6 +154,51 @@ _MIME_TYPES = {
 }
 
 
+def _build_job_result(pieces: list, dowels: list, basename: str, fmt: str, bed_size: str) -> dict[str, Any]:
+    """Build the `job.result` payload (previews + final download bytes) from
+    a finished (pieces, dowels) pair. Shared between `_run_job` (the
+    single-shot "Quick split" pipeline) and `finish_session` (the
+    interactive-mode "Finish" step) — both end up with the same
+    (pieces, dowels) shape at this point and need identical preview/export
+    handling, just reached via a different route to get there."""
+    # Preview data is always per-piece/per-dowel STL bytes for the three.js
+    # viewer, independent of the chosen download format. Pieces and dowels
+    # are exported (and previewed) separately so the piece count in each
+    # preview list matches what's shown.
+    piece_files = export_pieces(pieces, basename, "stl")
+    previews = [
+        {"name": name, "data_base64": base64.b64encode(data).decode()}
+        for name, data in piece_files
+    ]
+    dowel_previews = []
+    if dowels:
+        dowel_only_files = export_pieces([], basename, "stl", dowels=dowels)
+        if dowel_only_files:
+            name, data = dowel_only_files[0]
+            dowel_previews.append({"name": name, "data_base64": base64.b64encode(data).decode()})
+
+    files = export_pieces(pieces, basename, fmt, dowels=dowels, bed_size=bed_size)
+    if len(files) == 1:
+        download_name, download_bytes = files[0]
+    else:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name, data in files:
+                zf.writestr(name, data)
+        download_name = f"{basename}_split.zip"
+        download_bytes = buf.getvalue()
+
+    return {
+        "piece_count": len(pieces),
+        "dowel_count": len(dowels),
+        "previews": previews,
+        "dowel_previews": dowel_previews,
+        "download_name": download_name,
+        "download_base64": base64.b64encode(download_bytes).decode(),
+        "download_mime": _MIME_TYPES.get(fmt, "application/octet-stream"),
+    }
+
+
 def _run_job(
     job_id: str,
     raw: bytes,
@@ -166,43 +220,7 @@ def _run_job(
         pieces, dowels = run_pipeline(mesh, params, progress=reporter)
 
         basename = os.path.splitext(os.path.basename(filename))[0]
-
-        # Preview data is always per-piece/per-dowel STL bytes for the
-        # three.js viewer, independent of the chosen download format. Pieces
-        # and dowels are exported (and previewed) separately so the piece
-        # count in each preview list matches what's shown.
-        piece_files = export_pieces(pieces, basename, "stl")
-        previews = [
-            {"name": name, "data_base64": base64.b64encode(data).decode()}
-            for name, data in piece_files
-        ]
-        dowel_previews = []
-        if dowels:
-            dowel_only_files = export_pieces([], basename, "stl", dowels=dowels)
-            if dowel_only_files:
-                name, data = dowel_only_files[0]
-                dowel_previews.append({"name": name, "data_base64": base64.b64encode(data).decode()})
-
-        files = export_pieces(pieces, basename, fmt, dowels=dowels, bed_size=bed_size)
-        if len(files) == 1:
-            download_name, download_bytes = files[0]
-        else:
-            buf = io.BytesIO()
-            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                for name, data in files:
-                    zf.writestr(name, data)
-            download_name = f"{basename}_split.zip"
-            download_bytes = buf.getvalue()
-
-        job.result = {
-            "piece_count": len(pieces),
-            "dowel_count": len(dowels),
-            "previews": previews,
-            "dowel_previews": dowel_previews,
-            "download_name": download_name,
-            "download_base64": base64.b64encode(download_bytes).decode(),
-            "download_mime": _MIME_TYPES.get(fmt, "application/octet-stream"),
-        }
+        job.result = _build_job_result(pieces, dowels, basename, fmt, bed_size)
         job.status = "done"
         job.message = "Done"
         job.fraction = 1.0
@@ -243,6 +261,7 @@ async def create_job(
     no_connectors: bool = Form(False),
     hollow_wall: str | None = Form(None),
     allow_non_watertight: bool = Form(False),
+    allow_floating_regions: bool = Form(False),
     format: str = Form("stl"),
     bed_size: str = Form(DEFAULT_BED_SIZE),
 ):
@@ -295,6 +314,7 @@ async def create_job(
         dowel_shape=dowel_shape,
         no_connectors=no_connectors,
         hollow_wall_thickness=_parse_float(hollow_wall),
+        allow_floating_regions=allow_floating_regions,
     )
 
     try:
@@ -348,6 +368,7 @@ async def plane_preview(
     target_dim: str | None = Form(None),
     spacing: str | None = Form(None),
     pieces: str | None = Form(None),
+    preview_id: str | None = Form(None),
 ):
     """Compute (smart, auto-placed) cut plane positions for the interactive
     editor, without running the full split/connector pipeline. Used so the
@@ -365,7 +386,14 @@ async def plane_preview(
     requests per axis, back-to-back, that meant one slow axis blocked every
     other axis's (otherwise fast) request, and even the SSE job-progress
     stream, until it finished. Offloading to a thread via `asyncio.to_thread`
-    lets them actually run concurrently instead of queuing behind each other."""
+    lets them actually run concurrently instead of queuing behind each other.
+
+    `preview_id`, if given, registers a cancellable slot for this specific
+    computation (see `_PREVIEW_CANCEL_EVENTS` and `cancel_plane_preview`
+    below) — the frontend generates one per debounced request so it can stop
+    a long-running search directly (via the "Stop" control next to the
+    "computing…" spinner) instead of only ever discarding the eventual,
+    still-running-in-the-background result."""
     from .geometry import axis_index, compute_cut_planes, scale_mesh
 
     scale_ref_axis = scale_axis or axis
@@ -377,6 +405,12 @@ async def plane_preview(
     raw = await file.read()
     filename = file.filename or "input.stl"
 
+    cancel_event = None
+    if preview_id is not None:
+        cancel_event = threading.Event()
+        with _PREVIEW_CANCEL_LOCK:
+            _PREVIEW_CANCEL_EVENTS[preview_id] = cancel_event
+
     def _compute():
         mesh = load_mesh_from_bytes(raw, filename, allow_non_watertight=True)
         pre_extent = float(mesh.extents[axis_index(scale_ref_axis)])
@@ -384,7 +418,7 @@ async def plane_preview(
         # With neither spacing nor pieces given, just return bounds/scale so
         # the UI can size a manual editor; no auto-computed planes to offer.
         planes = (
-            compute_cut_planes(mesh, axis, spacing=spacing_val, pieces=pieces_val)
+            compute_cut_planes(mesh, axis, spacing=spacing_val, pieces=pieces_val, cancel_event=cancel_event)
             if spacing_val is not None or pieces_val is not None
             else []
         )
@@ -392,10 +426,16 @@ async def plane_preview(
 
     try:
         mesh, pre_extent, planes = await asyncio.to_thread(_compute)
+    except JobCancelled:
+        return {"cancelled": True}
     except ValueError as e:
         return JSONResponse({"detail": str(e)}, status_code=400)
     except Exception as e:  # noqa: BLE001 - surface unexpected errors instead of a bare 500
         return JSONResponse({"detail": f"Unexpected error: {e}"}, status_code=400)
+    finally:
+        if preview_id is not None:
+            with _PREVIEW_CANCEL_LOCK:
+                _PREVIEW_CANCEL_EVENTS.pop(preview_id, None)
 
     if scale_val is not None:
         scale_factor = scale_val
@@ -411,6 +451,348 @@ async def plane_preview(
         "bounds": mesh.bounds.tolist(),
         "scale_factor": scale_factor,
     }
+
+
+@app.post("/plane_preview/{preview_id}/cancel")
+async def cancel_plane_preview(preview_id: str):
+    """Requests cancellation of one in-flight /plane_preview computation.
+    Cooperative, like job cancellation (see `cancel_job` below) — flips the
+    matching event and returns immediately; the preview's own response
+    (`{"cancelled": true}`) is what tells the caller it actually stopped.
+    A no-op (still 200) if `preview_id` is unknown, e.g. the computation
+    already finished by the time this arrives."""
+    with _PREVIEW_CANCEL_LOCK:
+        event = _PREVIEW_CANCEL_EVENTS.get(preview_id)
+    if event is not None:
+        event.set()
+    return {"status": "ok"}
+
+
+# --- Interactive split mode: per-piece cut-tree sessions -------------------
+#
+# Unlike /jobs (upload once, configure everything, submit once, get final
+# pieces back), this mode holds a whole cut TREE server-side across several
+# requests: cut one piece, look at its children, pick one, cut IT
+# differently, etc. See stlsplit/sessions.py for the tree/undo bookkeeping
+# itself; everything here is thin HTTP plumbing over that.
+
+
+def _sweep_sessions_periodically() -> None:
+    from .sessions import sweep_expired_sessions
+
+    sweep_expired_sessions()
+    timer = threading.Timer(300.0, _sweep_sessions_periodically)
+    timer.daemon = True  # never blocks process exit (e.g. during tests importing this module)
+    timer.start()
+
+
+_sweep_sessions_periodically()
+
+
+@app.post("/sessions")
+async def create_session_endpoint(
+    file: UploadFile,
+    scale: str | None = Form(None),
+    target_dim: str | None = Form(None),
+    scale_axis: str = Form("z"),
+    hollow_wall: str | None = Form(None),
+    allow_non_watertight: bool = Form(False),
+):
+    """Upload + scale (+ optionally hollow) a mesh, creating a new
+    interactive session whose root piece is the result. Returns piece
+    summary + scale_factor; the mesh preview itself is fetched separately
+    via GET .../pieces/{piece_id}/preview (kept out of this response since a
+    client that already knows it doesn't need it yet shouldn't have to pay
+    for it).
+
+    `hollow_wall`, if given, hollows the mesh (see hollow.hollow_mesh) right
+    after scaling and before any cutting happens — matching the single-shot
+    pipeline's order (scale, then hollow, then cut) and the fact that
+    hollowing an already-cut piece is a much stranger operation to reason
+    about (which of its now-open cut faces should stay solid?) than hollowing
+    the one, still-whole starting mesh."""
+    from .geometry import axis_index, scale_mesh
+    from .hollow import hollow_mesh
+    from .sessions import create_session
+
+    raw = await file.read()
+    filename = file.filename or "input.stl"
+    scale_val, target_dim_val = _parse_float(scale), _parse_float(target_dim)
+    hollow_val = _parse_float(hollow_wall)
+
+    def _prepare():
+        mesh = load_mesh_from_bytes(raw, filename, allow_non_watertight=allow_non_watertight)
+        pre_extent = float(mesh.extents[axis_index(scale_axis)])
+        mesh = scale_mesh(mesh, scale=scale_val, target_dim=target_dim_val, axis=scale_axis)
+        if hollow_val is not None:
+            mesh = hollow_mesh(mesh, hollow_val)
+        return mesh, pre_extent
+
+    try:
+        mesh, pre_extent = await asyncio.to_thread(_prepare)
+    except (ValueError, RuntimeError) as e:
+        return JSONResponse({"detail": str(e)}, status_code=400)
+
+    if scale_val is not None:
+        scale_factor = scale_val
+    elif target_dim_val is not None and pre_extent > 0:
+        scale_factor = target_dim_val / pre_extent
+    else:
+        scale_factor = 1.0
+
+    session = create_session(mesh, filename, scale_factor)
+    root = session.pieces["root"]
+    return {
+        "session_id": session.id,
+        "piece_id": "root",
+        "extents": root.mesh.extents.tolist(),
+        "volume": float(root.mesh.volume),
+        "bounds": root.mesh.bounds.tolist(),
+        "scale_factor": scale_factor,
+    }
+
+
+@app.get("/sessions/{session_id}")
+async def session_tree(session_id: str):
+    from .sessions import get_session, tree_summary
+
+    session = get_session(session_id)
+    if session is None:
+        return JSONResponse({"detail": "Unknown or expired session"}, status_code=404)
+    return tree_summary(session)
+
+
+@app.get("/sessions/{session_id}/pieces/{piece_id}/preview")
+async def piece_preview(session_id: str, piece_id: str):
+    """STL bytes (base64) for one piece — fetched on demand rather than
+    every session mutation pushing full mesh bytes for every piece it
+    touches."""
+    from .sessions import get_session
+
+    session = get_session(session_id)
+    if session is None:
+        return JSONResponse({"detail": "Unknown or expired session"}, status_code=404)
+    node = session.pieces.get(piece_id)
+    if node is None:
+        return JSONResponse({"detail": "Unknown piece"}, status_code=404)
+    data = export_pieces([node.mesh], "piece", "stl")[0][1]
+    return {"data_base64": base64.b64encode(data).decode()}
+
+
+@app.post("/sessions/{session_id}/pieces/{piece_id}/plane_preview")
+async def piece_plane_preview(
+    session_id: str,
+    piece_id: str,
+    axis: str = Form("z"),
+    spacing: str | None = Form(None),
+    pieces: str | None = Form(None),
+):
+    """Auto-placed cut plane positions for one specific (already-in-session)
+    piece — the per-piece analogue of the top-level /plane_preview, but
+    scoped to a piece that already lives in the session instead of
+    re-uploading/re-scaling the whole file each time."""
+    from .geometry import compute_cut_planes
+    from .sessions import get_session
+
+    session = get_session(session_id)
+    if session is None:
+        return JSONResponse({"detail": "Unknown or expired session"}, status_code=404)
+    node = session.pieces.get(piece_id)
+    if node is None or piece_id not in session.leaves:
+        return JSONResponse({"detail": "Piece is not a current leaf"}, status_code=400)
+
+    spacing_val, pieces_val = _parse_float(spacing), _parse_int(pieces)
+    if spacing_val is not None and pieces_val is not None:
+        return JSONResponse({"detail": "specify only one of spacing or pieces"}, status_code=400)
+
+    def _compute():
+        return compute_cut_planes(node.mesh, axis, spacing=spacing_val, pieces=pieces_val)
+
+    try:
+        planes = (
+            await asyncio.to_thread(_compute)
+            if (spacing_val is not None or pieces_val is not None)
+            else []
+        )
+    except Exception as e:  # noqa: BLE001 - surface unexpected errors instead of a bare 500
+        return JSONResponse({"detail": f"Unexpected error: {e}"}, status_code=400)
+
+    return {"planes": planes, "bounds": node.mesh.bounds.tolist()}
+
+
+@app.post("/sessions/{session_id}/pieces/{piece_id}/cut")
+async def cut_piece_endpoint(
+    session_id: str,
+    piece_id: str,
+    axis: str = Form("z"),
+    cut_planes: str = Form(""),
+    allow_floating_regions: bool = Form(False),
+):
+    from .sessions import cut_piece, get_session
+
+    session = get_session(session_id)
+    if session is None:
+        return JSONResponse({"detail": "Unknown or expired session"}, status_code=404)
+
+    try:
+        cuts = _parse_cut_planes(cut_planes)
+    except ValueError:
+        return JSONResponse({"detail": f"Invalid cut_planes value '{cut_planes}'"}, status_code=400)
+    if not cuts:
+        return JSONResponse({"detail": "No cut planes given"}, status_code=400)
+
+    def _do_cut():
+        with session.lock:
+            return cut_piece(session, piece_id, axis, cuts, allow_floating_regions=allow_floating_regions)
+
+    try:
+        children = await asyncio.to_thread(_do_cut)
+    except KeyError as e:
+        return JSONResponse({"detail": str(e).strip("'\"")}, status_code=400)
+    except CutPlacementError as e:
+        return JSONResponse({"detail": str(e), "axis": e.axis, "positions": e.positions}, status_code=400)
+    except Exception as e:  # noqa: BLE001 - surface unexpected errors instead of a bare 500
+        return JSONResponse({"detail": f"Unexpected error: {e}"}, status_code=400)
+
+    return {
+        "children": [
+            {
+                "piece_id": c.id,
+                "extents": c.mesh.extents.tolist(),
+                "volume": float(c.mesh.volume),
+                "bounds": c.mesh.bounds.tolist(),
+            }
+            for c in children
+        ]
+    }
+
+
+@app.post("/sessions/{session_id}/pieces/{piece_id}/undo")
+async def undo_cut_endpoint(session_id: str, piece_id: str):
+    from .sessions import get_session, undo_cut
+
+    session = get_session(session_id)
+    if session is None:
+        return JSONResponse({"detail": "Unknown or expired session"}, status_code=404)
+    try:
+        with session.lock:
+            undo_cut(session, piece_id)
+    except KeyError as e:
+        return JSONResponse({"detail": str(e).strip("'\"")}, status_code=400)
+    return {"status": "ok"}
+
+
+@app.post("/sessions/{session_id}/pieces/{piece_id}/rotate")
+async def rotate_piece_endpoint(session_id: str, piece_id: str, axis: str = Form("z"), degrees: float = Form(90.0)):
+    """Reorients a leaf piece in place (no cut, no tree change) -- lets the
+    user reorient a piece for easier cutting or printing without it counting
+    as a cut interface. See sessions.rotate_piece."""
+    from .sessions import get_session, rotate_piece
+
+    session = get_session(session_id)
+    if session is None:
+        return JSONResponse({"detail": "Unknown or expired session"}, status_code=404)
+    try:
+        with session.lock:
+            node = rotate_piece(session, piece_id, axis, degrees)
+    except KeyError as e:
+        return JSONResponse({"detail": str(e).strip("'\"")}, status_code=400)
+    except Exception as e:  # noqa: BLE001 - surface unexpected errors instead of a bare 500
+        return JSONResponse({"detail": f"Unexpected error: {e}"}, status_code=400)
+
+    return {
+        "piece_id": node.id,
+        "extents": node.mesh.extents.tolist(),
+        "volume": float(node.mesh.volume),
+        "bounds": node.mesh.bounds.tolist(),
+    }
+
+
+@app.delete("/sessions/{session_id}")
+async def delete_session_endpoint(session_id: str):
+    from .sessions import close_session
+
+    close_session(session_id)
+    return {"status": "ok"}
+
+
+@app.post("/sessions/{session_id}/finish")
+async def finish_session(
+    session_id: str,
+    peg_diameter: float = Form(7.0),
+    peg_length: float = Form(5.0),
+    peg_clearance: float = Form(0.18),
+    n_pegs: int = Form(4),
+    min_wall_thickness: float = Form(1.2),
+    alignment_key: bool = Form(False),
+    dowel_shape: str = Form("round"),
+    no_connectors: bool = Form(False),
+    format: str = Form("stl"),
+    bed_size: str = Form(DEFAULT_BED_SIZE),
+):
+    """Places connectors across the WHOLE cut tree in one pass (see
+    `connectors.add_connectors_after_cuts`, which already handles an
+    arbitrary multi-level tree given every ResolvedCut applied anywhere in
+    it — the same mechanism that fixed a real bug where eager per-axis
+    connector placement could get sliced through by a later cut) and
+    exports, reusing the exact Job/SSE progress mechanism /jobs uses so the
+    frontend's existing streamJob/ProgressBar/ResultModal work unchanged."""
+    from .connectors import add_connectors_after_cuts
+    from .sessions import get_session
+
+    if format not in SUPPORTED_FORMATS:
+        return JSONResponse({"detail": f"Unsupported format '{format}'"}, status_code=400)
+    if dowel_shape not in SUPPORTED_SHAPES:
+        return JSONResponse({"detail": f"Unsupported dowel shape '{dowel_shape}'"}, status_code=400)
+    if bed_size not in BED_SIZE_PRESETS:
+        return JSONResponse({"detail": f"Unsupported bed_size '{bed_size}'"}, status_code=400)
+
+    session = get_session(session_id)
+    if session is None:
+        return JSONResponse({"detail": "Unknown or expired session"}, status_code=404)
+
+    connector_kwargs = None if no_connectors else dict(
+        peg_diameter=peg_diameter, peg_length=peg_length, peg_clearance=peg_clearance,
+        n_pegs=n_pegs, min_wall_thickness=min_wall_thickness, alignment_key=alignment_key,
+        dowel_shape=dowel_shape,
+    )
+
+    job_id = uuid.uuid4().hex
+    with _JOBS_LOCK:
+        _JOBS[job_id] = Job()
+
+    def _run():
+        job = _JOBS[job_id]
+
+        def on_update(message: str, fraction: float | None) -> None:
+            job.message, job.fraction = message, fraction
+
+        try:
+            reporter = ProgressReporter(on_update, cancel_event=job.cancel_event)
+            with session.lock:
+                leaf_ids = sorted(session.leaves)
+                leaf_meshes = [session.pieces[pid].mesh for pid in leaf_ids]
+                applied_cuts = list(session.applied_cuts)
+            if connector_kwargs is not None:
+                pieces, dowels = add_connectors_after_cuts(leaf_meshes, applied_cuts, connector_kwargs, reporter)
+            else:
+                pieces, dowels = leaf_meshes, []
+
+            basename = os.path.splitext(os.path.basename(session.filename))[0]
+            job.result = _build_job_result(pieces, dowels, basename, format, bed_size)
+            job.status = "done"
+            job.message = "Done"
+            job.fraction = 1.0
+        except JobCancelled:
+            job.status = "cancelled"
+            job.message = "Cancelled"
+        except Exception as e:  # noqa: BLE001 - surface unexpected errors to the client instead of hanging the poll
+            job.status = "error"
+            job.error = f"Unexpected error: {e}"
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    return JSONResponse({"job_id": job_id})
 
 
 def _job_payload(job: Job) -> dict[str, Any]:

@@ -36,10 +36,17 @@
    long. Scoped to .split-form so the preview pane (piece cards, etc.) keeps
    normal Bootstrap sizing — this is specifically about packing a lot of
    inputs into a narrow sidebar without it turning into a scroll marathon. */
-.split-form .card { margin-bottom: 0.5rem; }
-.split-form .card-header { padding: 0.35rem 0.6rem; font-size: 0.78rem; }
-.split-form .card-body { padding: 0.5rem 0.6rem; }
-.split-form label.form-label { margin-bottom: 0.1rem; font-size: 0.72rem; }
+/* .compact-form-card opts a specific card into the same density outside
+   .split-form -- used by Interactive split's Input/Finish cards, which are
+   the same kind of settings-form content Quick split packs into its
+   sidebar, just laid out inline in the main column instead. Interactive
+   split's "Active piece" card is deliberately NOT included: it plays the
+   same role as Quick split's #plane-editor card in .preview-pane (viewer +
+   cut controls together), which already keeps normal Bootstrap sizing. */
+.split-form .card, .compact-form-card { margin-bottom: 0.5rem; }
+.split-form .card-header, .compact-form-card .card-header { padding: 0.35rem 0.6rem; font-size: 0.78rem; }
+.split-form .card-body, .compact-form-card .card-body { padding: 0.5rem 0.6rem; }
+.split-form label.form-label, .compact-form-card label.form-label { margin-bottom: 0.1rem; font-size: 0.72rem; }
 .split-form .form-control, .split-form .form-select {
   padding: 0.2rem 0.45rem; font-size: 0.78rem; min-height: 27px;
 }
@@ -79,8 +86,15 @@
 .mesh-viewer { position: relative; width: 100%; background: #0e0f13; border-radius: var(--bs-border-radius); overflow: hidden; }
 .mesh-viewer-canvas { width: 100%; height: 100%; }
 /* Scales with viewport height on large screens (more vertical room to work
-   with) but never shrinks below a usable size or grows absurdly tall. */
-.editor-wrap .mesh-viewer { height: clamp(420px, 62vh, 800px); }
+   with) but never shrinks below a usable size or grows absurdly tall.
+   resize: vertical + overflow: hidden lets the user drag the bottom-right
+   corner to grow/shrink it -- the resulting inline height then wins over
+   this rule, which is fine, that's the point. */
+.editor-wrap .mesh-viewer { height: clamp(520px, 78vh, 1000px); min-height: 320px; max-height: 90vh; resize: vertical; overflow: hidden; }
+
+/* Native Fullscreen API target -- fills the screen and drops the resize
+   handle/clamp since there's nothing left to resize against. */
+.editor-wrap .mesh-viewer:fullscreen { width: 100vw; height: 100vh; max-height: none; resize: none; border-radius: 0; }
 
 .view-toolbar { position: absolute; top: 10px; right: 10px; z-index: 10; }
 
@@ -123,7 +137,7 @@
 @media (max-width: 991.98px) {
   .layout { flex-direction: column; }
   .layout > .split-form { position: static; max-height: none; width: 100%; flex-basis: auto; }
-  .editor-wrap .mesh-viewer { height: 60vh; min-height: 320px; }
+  .editor-wrap .mesh-viewer { height: 60vh; min-height: 320px; max-height: none; }
   #submit-bar { position: static; background: none; margin: 0.8em 0 0; }
 }
 

@@ -27,6 +27,15 @@ export default {
         <input type="number" step="any" class="form-control" v-model="form.hollow_wall">
         <div class="form-text">Thin shells may not have room for connectors at every interface — sockets are skipped wherever the wall is too thin rather than punching through.</div>
       </div>
+
+      <div class="section-block">
+        <div class="section-block-header"><i class="bi bi-exclamation-triangle"></i> Cut checks</div>
+        <div class="form-check">
+          <input type="checkbox" class="form-check-input" id="i-allow-floating-adv" v-model="form.allow_floating_regions">
+          <label class="form-check-label" for="i-allow-floating-adv">Allow disconnected regions from a cut</label>
+        </div>
+        <div class="form-text">Normally a cut that lands where the model pinches to nothing (splitting a piece into unattached "floating" chunks) is rejected. Enable this to allow it through instead of having to reposition the cut.</div>
+      </div>
     </div>
   `,
 };

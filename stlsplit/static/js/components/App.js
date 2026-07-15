@@ -14,6 +14,7 @@ import MeshViewer from "./MeshViewer.js";
 import ProgressBar from "./ProgressBar.js";
 import PieceGrid from "./PieceGrid.js";
 import ResultModal from "./ResultModal.js";
+import InteractiveSplit from "./InteractiveSplit.js";
 
 const TABS = [
   { id: "split", label: "Split" },
@@ -26,10 +27,19 @@ export default {
   name: "App",
   components: {
     InputSection, PresetBar, TabNav, SplitSection, AxisPlaneEditor, ConnectorsSection,
-    OutputSection, AdvancedSection, MeshViewer, ProgressBar, PieceGrid, ResultModal,
+    OutputSection, AdvancedSection, MeshViewer, ProgressBar, PieceGrid, ResultModal, InteractiveSplit,
   },
   template: `
-    <div class="layout">
+    <div class="btn-group mb-3" role="group" aria-label="Split mode">
+      <button type="button" class="btn" :class="mode === 'interactive' ? 'btn-primary' : 'btn-outline-primary'"
+              @click="mode = 'interactive'">Interactive split</button>
+      <button type="button" class="btn" :class="mode === 'quick' ? 'btn-primary' : 'btn-outline-primary'"
+              @click="mode = 'quick'">Quick split</button>
+    </div>
+
+    <interactive-split v-if="mode === 'interactive'"></interactive-split>
+
+    <div class="layout" v-else>
       <form class="split-form" :class="{ busy: job.status === 'running' }" @submit.prevent="onSubmit">
         <input-section @file-selected="onFileSelected"></input-section>
         <preset-bar :form="form" @apply="applyPreset"></preset-bar>
@@ -82,6 +92,12 @@ export default {
         <h3 class="h5 mt-4">Pieces</h3>
         <div v-if="job.status === 'error'" class="alert alert-danger">
           Error: {{ job.error }}<span v-if="errorHighlighted"> (see the highlighted cut below)</span>
+          <template v-if="!form.allow_floating_regions && /pinches to nothing/.test(job.error)">
+            <br>
+            <button type="button" class="btn btn-link btn-sm p-0 mt-1" @click="form.allow_floating_regions = true; onSubmit()">
+              Allow disconnected regions and retry
+            </button>
+          </template>
         </div>
         <div v-if="job.status === 'cancelled'" class="alert alert-secondary">
           Cancelled — no pieces were generated. Adjust settings and split again whenever you're ready.
@@ -117,6 +133,8 @@ export default {
     </footer>
   `,
   setup() {
+    const mode = ref("interactive"); // "quick" | "interactive" -- see InteractiveSplit.js for the latter
+
     const store = useSplitForm();
     const { form, axisControllers, job, anyAxisUsable, resultStale, refreshAllAxisPreviews, applyPreset } = store;
 
@@ -176,6 +194,7 @@ export default {
     }
 
     return {
+      mode,
       form, axisControllers, job, anyAxisUsable, resultStale, refreshAllAxisPreviews, applyPreset,
       inputBuffer, onFileSelected, axisData, errorHighlighted, downloadUrl, onSubmit,
       modalPiece, modalColor, openModal, closeModal,

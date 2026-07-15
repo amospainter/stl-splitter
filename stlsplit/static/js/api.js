@@ -59,9 +59,26 @@ export function streamJob(jobId, onUpdate) {
 // Computes (smart, auto-placed) cut plane positions for one axis, without
 // running the full split/connector pipeline — used to keep the interactive
 // plane editor's gizmos in sync as scale/spacing/piece-count inputs change.
+// Resolves to { cancelled: true } if the computation was stopped via
+// cancelPlanePreview before it finished, rather than throwing.
 export async function planePreview(formData) {
   const resp = await fetch("/plane_preview", { method: "POST", body: formData });
   const data = await resp.json();
   if (!resp.ok) throw new Error(data.detail || "preview failed");
   return data;
+}
+
+// Requests cancellation of one in-flight /plane_preview computation (the
+// "auto-placed cut planes" search, which can take tens of seconds on a
+// large/complex mesh). Cooperative, like cancelJob — this just signals it;
+// the matching planePreview() call is what resolves once it actually stops.
+// Best-effort: a failed request here isn't worth surfacing, since the
+// computation either finishes on its own or the next debounced request
+// supersedes it anyway.
+export async function cancelPlanePreview(previewId) {
+  try {
+    await fetch(`/plane_preview/${previewId}/cancel`, { method: "POST" });
+  } catch (err) {
+    // best-effort, see above
+  }
 }

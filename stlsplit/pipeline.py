@@ -5,12 +5,13 @@ import os
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 
+import numpy as np
 import trimesh
 
 from .autofit import auto_fit_split
-from .connectors import SUPPORTED_SHAPES, add_connectors
+from .connectors import SUPPORTED_SHAPES, add_connectors, add_connectors_after_cuts
 from .cutting import cut_mesh
-from .geometry import Cut, CutPlacementError, axis_index, compute_cut_planes, resolve_cuts, scale_mesh
+from .geometry import Cut, CutPlacementError, ResolvedCut, axis_index, compute_cut_planes, resolve_cuts, scale_mesh
 from .hollow import hollow_mesh
 from .progress import JobCancelled, ProgressReporter
 
@@ -21,12 +22,18 @@ from .progress import JobCancelled, ProgressReporter
 _MIN_PIECES_FOR_PARALLEL = 2
 
 
-def _cut_mesh_or_raise(mesh: trimesh.Trimesh, resolved, axis: str, progress: ProgressReporter | None):
+def _cut_mesh_or_raise(
+    mesh: trimesh.Trimesh,
+    resolved,
+    axis: str,
+    progress: ProgressReporter | None,
+    allow_floating_regions: bool = False,
+):
     """cut_mesh, but on failure fills in which axis and cut position(s) are
     responsible before re-raising, so the caller can point the user at the
     specific cut instead of just a piece number."""
     try:
-        return cut_mesh(mesh, resolved, progress=progress)
+        return cut_mesh(mesh, resolved, progress=progress, allow_floating_regions=allow_floating_regions)
     except CutPlacementError as e:
         _annotate_cut_error(e, resolved, axis)
         raise
@@ -45,34 +52,31 @@ def _process_one_piece(
     faces,
     axis: str,
     planes: list,
-    connector_kwargs: dict | None,
+    allow_floating_regions: bool = False,
 ):
-    """Worker body for splitting a single top-level piece on one axis (cut +
-    its own connectors), run in a separate process. Takes/returns plain
+    """Worker body for splitting a single top-level piece on one axis (cut
+    only — connectors are added afterward, once, over the FINAL pieces; see
+    `_add_connectors_after_cuts`. Placing them per-axis here, before later
+    axes are cut, would let a later perpendicular cut slice through an
+    already-carved socket.) Runs in a separate process. Takes/returns plain
     vertex/face arrays rather than `trimesh.Trimesh` objects: a `Trimesh`
     can carry cached, unpicklable state (e.g. a ray-query engine) once
     something downstream has touched it, and the plain-array round trip
     sidesteps that entirely rather than depending on what happens to be
-    picklable today. Runs the *entire* per-piece workload (cut, then
-    connectors on the resulting sub-pieces) in one process, since piece i's
-    cut/connector work never touches piece j's — the same independence the
-    sequential loop already relied on, just executed off the main process."""
+    picklable today."""
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     idx = axis_index(axis)
     lo, hi = mesh.bounds[0][idx], mesh.bounds[1][idx]
     relevant = [p for p in planes if lo < Cut.coerce(p).position < hi]
     resolved = resolve_cuts(mesh, axis, relevant)
     try:
-        sub_pieces = cut_mesh(mesh, resolved)
+        sub_pieces = cut_mesh(mesh, resolved, allow_floating_regions=allow_floating_regions)
     except CutPlacementError as e:
         _annotate_cut_error(e, resolved, axis)
         raise
-    dowels: list[trimesh.Trimesh] = []
-    if resolved and connector_kwargs is not None:
-        sub_pieces, dowels = add_connectors(sub_pieces, resolved, **connector_kwargs)
     return (
         [(p.vertices, p.faces) for p in sub_pieces],
-        [(d.vertices, d.faces) for d in dowels],
+        [(c.origin, c.normal, c.position) for c in resolved],
     )
 
 
@@ -87,6 +91,7 @@ class PipelineParams:
     axis_cuts: dict[str, list["Cut | float"]] | None = None  # e.g. {"x": [...], "z": [...]} for splitting on multiple axes
     axis_order: str = "zxy"  # order to apply axis_cuts in when multiple axes are set; a permutation of "xyz"
     bed_dims: dict[str, float] = field(default_factory=dict)
+    allow_rotation: bool = True  # bed_dims mode only: reorient a piece (90-degree multiples) to avoid an unnecessary cut
     peg_diameter: float = 7.0
     peg_length: float = 5.0
     peg_clearance: float = 0.18
@@ -96,6 +101,11 @@ class PipelineParams:
     dowel_shape: str = "round"
     no_connectors: bool = False
     hollow_wall_thickness: float | None = None
+    # Escape hatch for _check_no_floating_regions: skip the "pinches to
+    # nothing" error and let a cut through disconnected geometry go ahead
+    # rather than forcing the user to keep hunting for a plane position that
+    # avoids it entirely.
+    allow_floating_regions: bool = False
 
     def validate(self) -> None:
         has_single_axis = self.spacing is not None or self.pieces is not None or self.cut_planes is not None
@@ -140,9 +150,9 @@ def _cut_all_axes(
     mesh: trimesh.Trimesh,
     axis_cuts: dict[str, list[float]],
     axis_order: str,
-    connector_kwargs: dict | None,
     progress: ProgressReporter | None,
-) -> tuple[list[trimesh.Trimesh], list[trimesh.Trimesh]]:
+    allow_floating_regions: bool = False,
+) -> tuple[list[trimesh.Trimesh], list[ResolvedCut]]:
     """Split on each axis present in `axis_cuts`, in `axis_order` (default
     Z, X, Y — cutting the tall/primary axis first tends to leave larger,
     better-connected intermediate pieces than cutting a thin secondary axis
@@ -150,34 +160,45 @@ def _cut_all_axes(
     every piece produced so far again on the next axis. Plane positions are
     absolute coordinates (as picked by the user against the whole, unsplit
     mesh), so for each piece only the planes that actually fall inside that
-    piece's current bounds on that axis are applied."""
+    piece's current bounds on that axis are applied.
+
+    Cuts only — no connectors are added here. Connectors are placed in a
+    single pass over the FINAL pieces afterward (see
+    `_add_connectors_after_cuts`), so a later axis's cut can never slice
+    through a socket an earlier axis already carved. Returns
+    (pieces, applied_cuts): `applied_cuts` is every `ResolvedCut` actually
+    used, across every axis and every piece it was applied to (not
+    deduplicated — the same logical cut plane is recorded once per
+    sub-piece it touches; the caller merges these)."""
     pieces = [mesh]
-    dowels: list[trimesh.Trimesh] = []
+    applied_cuts: list[ResolvedCut] = []
     ordered_axes = [a for a in axis_order.lower() if a in axis_cuts]
     for axis in ordered_axes:
         planes = axis_cuts[axis]
         idx = axis_index(axis)
 
         if len(pieces) >= _MIN_PIECES_FOR_PARALLEL:
-            # Each top-level piece's cut + its own connectors are fully
-            # independent of every other piece's (they only ever touch their
-            # own geometry), so this loop iteration is the natural boundary
-            # to parallelize across cores instead of running one piece at a
-            # time on a single core.
+            # Each top-level piece's cut is fully independent of every other
+            # piece's (they only ever touch their own geometry), so this
+            # loop iteration is the natural boundary to parallelize across
+            # cores instead of running one piece at a time on a single core.
             next_pieces = []
             max_workers = min(len(pieces), os.cpu_count() or 1)
             with ProcessPoolExecutor(max_workers=max_workers) as pool:
                 futures = [
-                    pool.submit(_process_one_piece, piece.vertices, piece.faces, axis, planes, connector_kwargs)
+                    pool.submit(_process_one_piece, piece.vertices, piece.faces, axis, planes, allow_floating_regions)
                     for piece in pieces
                 ]
                 try:
                     for future in futures:
-                        piece_arrays, dowel_arrays = future.result()
+                        piece_arrays, cut_tuples = future.result()
                         next_pieces.extend(
                             trimesh.Trimesh(vertices=v, faces=f, process=False) for v, f in piece_arrays
                         )
-                        dowels.extend(trimesh.Trimesh(vertices=v, faces=f, process=False) for v, f in dowel_arrays)
+                        applied_cuts.extend(
+                            ResolvedCut(origin=np.asarray(o), normal=np.asarray(n), position=pos)
+                            for o, n, pos in cut_tuples
+                        )
                         if progress:
                             progress.step(f"Split a piece on {axis} axis")
                 except JobCancelled:
@@ -195,16 +216,14 @@ def _cut_all_axes(
                 lo, hi = piece.bounds[0][idx], piece.bounds[1][idx]
                 relevant = [p for p in planes if lo < Cut.coerce(p).position < hi]
                 resolved = resolve_cuts(piece, axis, relevant)
-                sub_pieces = _cut_mesh_or_raise(piece, resolved, axis, progress)
-                if resolved and connector_kwargs is not None:
-                    sub_pieces, sub_dowels = add_connectors(sub_pieces, resolved, progress=progress, **connector_kwargs)
-                    dowels.extend(sub_dowels)
+                sub_pieces = _cut_mesh_or_raise(piece, resolved, axis, progress, allow_floating_regions)
+                applied_cuts.extend(resolved)
                 next_pieces.extend(sub_pieces)
 
         pieces = next_pieces
         if progress:
             progress.step(f"Split on {axis} axis into {len(pieces)} piece(s)")
-    return pieces, dowels
+    return pieces, applied_cuts
 
 
 def run_pipeline(
@@ -234,6 +253,8 @@ def run_pipeline(
             params.bed_dims,
             connector_kwargs=None if params.no_connectors else params.connector_kwargs(),
             progress=progress,
+            allow_rotation=params.allow_rotation,
+            allow_floating_regions=params.allow_floating_regions,
         )
 
     if params.axis_cuts is not None:
@@ -256,21 +277,27 @@ def run_pipeline(
         if progress:
             ordered_axes = [a for a in params.axis_order.lower() if a in params.axis_cuts]
             total_cuts = sum(len(params.axis_cuts[a]) for a in ordered_axes)
-            per_cut_units = 2 if connector_kwargs is not None else 1  # cut + its connector interface
+            per_cut_units = 2 if connector_kwargs is not None else 1  # cut + its (later) connector interface
             already_done = 3 if params.hollow_wall_thickness is not None else 2  # loaded + scaled (+ hollowed)
             progress.set_total(already_done + total_cuts * per_cut_units + len(ordered_axes))
-        return _cut_all_axes(
-            mesh,
-            params.axis_cuts,
-            params.axis_order,
-            connector_kwargs=connector_kwargs,
-            progress=progress,
+        pieces, applied_cuts = _cut_all_axes(
+            mesh, params.axis_cuts, params.axis_order, progress=progress,
+            allow_floating_regions=params.allow_floating_regions,
         )
+        if connector_kwargs is None:
+            return pieces, []
+        # Connectors are placed once, over the FINAL pieces from every axis —
+        # never eagerly after a single axis's cuts — so a later perpendicular
+        # cut can never slice through an already-carved socket.
+        return add_connectors_after_cuts(pieces, applied_cuts, connector_kwargs, progress)
 
     if params.cut_planes is not None:
         planes = params.cut_planes
     else:
-        planes = compute_cut_planes(mesh, params.axis, spacing=params.spacing, pieces=params.pieces)
+        planes = compute_cut_planes(
+            mesh, params.axis, spacing=params.spacing, pieces=params.pieces,
+            cancel_event=progress.cancel_event if progress else None,
+        )
     resolved = resolve_cuts(mesh, params.axis, planes)
 
     if progress:
@@ -280,7 +307,7 @@ def run_pipeline(
         progress.set_total(base_steps + 1 + n_pieces + n_interfaces)  # + planes + cuts + connectors
         progress.step(f"Computed {len(resolved)} cut plane(s)")
 
-    pieces = _cut_mesh_or_raise(mesh, resolved, params.axis, progress)
+    pieces = _cut_mesh_or_raise(mesh, resolved, params.axis, progress, params.allow_floating_regions)
     dowels: list[trimesh.Trimesh] = []
     if resolved and not params.no_connectors:
         pieces, dowels = add_connectors(pieces, resolved, progress=progress, **params.connector_kwargs())

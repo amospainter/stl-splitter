@@ -57,6 +57,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bed-x", type=float, help="Print bed X dimension (mm); enables multi-axis auto-fit splitting")
     p.add_argument("--bed-y", type=float, help="Print bed Y dimension (mm); enables multi-axis auto-fit splitting")
     p.add_argument("--bed-z", type=float, help="Print bed Z dimension (mm); enables multi-axis auto-fit splitting")
+    p.add_argument(
+        "--no-auto-rotate",
+        action="store_true",
+        help="Auto-fit mode (--bed-x/-y/-z) only: don't reorient a piece (90-degree multiples) to fit the bed "
+        "without an extra cut -- always cut in place instead, even when a rotation would avoid it",
+    )
 
     p.add_argument("--peg-diameter", type=float, default=7.0, help="Dowel diameter in mm (default: 7)")
     p.add_argument("--peg-length", type=float, default=5.0, help="Socket depth per side in mm; the dowel spans roughly 2x this across the joint (default: 5)")
@@ -73,6 +79,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-non-watertight",
         action="store_true",
         help="Proceed even if the mesh is not watertight after automatic repair is attempted; boolean cuts/connectors may fail or produce bad geometry",
+    )
+    p.add_argument(
+        "--allow-floating-regions",
+        action="store_true",
+        help="Proceed even if a cut lands where the model pinches to nothing, leaving disconnected 'floating' "
+        "regions in a piece, instead of raising an error",
     )
 
     p.add_argument("--format", choices=SUPPORTED_FORMATS, default="stl", help="Output format: separate STL files, or one 3MF project bundling all pieces (default: stl)")
@@ -159,6 +171,7 @@ def main(argv: list[str] | None = None) -> int:
         axis_cuts=axis_cuts or None,
         axis_order=args.axis_order,
         bed_dims=bed_dims,
+        allow_rotation=not args.no_auto_rotate,
         peg_diameter=args.peg_diameter,
         peg_length=args.peg_length,
         peg_clearance=args.peg_clearance,
@@ -168,6 +181,7 @@ def main(argv: list[str] | None = None) -> int:
         dowel_shape=args.dowel_shape,
         no_connectors=args.no_connectors,
         hollow_wall_thickness=args.hollow_wall,
+        allow_floating_regions=args.allow_floating_regions,
     )
 
     try:
