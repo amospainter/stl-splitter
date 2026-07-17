@@ -760,7 +760,6 @@ def refine_cut_planes(
     search_frac: float = 0.4,
     min_gap_frac: float = 0.12,
     samples: int = 11,
-    improvement_ratio: float = 1.1,
     max_piece_size: float | None = None,
     executor: "ProcessPoolExecutor | None" = None,
     max_workers: int = 1,
@@ -769,18 +768,32 @@ def refine_cut_planes(
     graph_index: "GraphConnectivityIndex | None" = None,
     cancel_event: "threading.Event | None" = None,
 ) -> list[float]:
-    """Nudge each plane within a bounded local window to sit at a larger,
-    connectivity-safe cross-section, avoiding thin necks/slivers and the
-    disconnected "floating region" pieces that result from cutting exactly
-    at a pinch point. Movement is bounded and only taken when it's a clear
-    improvement, so evenly-spaced (symmetric) cuts are preserved unless
-    there's a good reason to move them; `max_piece_size` (e.g. from
-    --spacing) additionally caps how far a plane may drift so no piece
-    grows past that limit — but if no connectivity-safe spot exists within
-    the initial (small) search window, the window is progressively widened,
-    up to that same max_piece_size cap, before giving up: a piece coming out
-    smaller than the requested spacing/bed size is always acceptable, a
-    disconnected floating region never is.
+    """Nudge each plane, within a bounded local window, to the CLOSEST
+    position that yields connectivity-safe pieces — avoiding the disconnected
+    "floating region" pieces that result from cutting where the model pinches
+    to nothing (a thin neck, or across the gap of a free-hanging limb). A
+    plane whose even position is already safe isn't moved at all, and one
+    that must move takes the smallest step that reaches a safe spot rather
+    than jumping to the widest cross-section available: steering toward
+    maximum area drags cuts toward whatever is bulkiest (a statue's base, a
+    torso's hips) and pulls neighbouring planes together into thin slices,
+    which defeats the point of an even split. `max_piece_size` (e.g. from
+    --spacing) additionally caps how far a plane may drift so no piece grows
+    past that limit — but if no safe spot exists within the initial (small)
+    search window, the window is progressively widened, up to that cap,
+    before giving up: a piece coming out smaller than the requested
+    spacing/bed size is always acceptable, a disconnected floating region
+    never is.
+
+    NOTE: this is a greedy left-to-right placement — each plane is finalized
+    using the previous plane's already-chosen position as its left bound and
+    the whole material above as its right feasibility check. For most piece
+    counts that produces clean, near-even cuts, but on a mesh with a large
+    genuinely-disconnected band (a limb that hangs free over a long span) a
+    high piece count can strand a later plane with no safe spot its greedy
+    predecessors left room for, falling back to a best-effort cut that
+    cutting.py may then reject. That's inherent to the mesh's topology on
+    that axis, not a spacing the search can smooth away.
 
     `executor`, if given, is a live `ProcessPoolExecutor` used to check a
     whole batch of candidates' connectivity-safety concurrently instead of
@@ -843,6 +856,40 @@ def refine_cut_planes(
         if full_max_c < full_min_c:
             full_min_c = full_max_c = p_clamped
 
+        # A cut at `c` is "safe" when the piece to its LEFT, [left_bound, c],
+        # is a single connected solid AND the entire remaining material above
+        # it, [c, hi], is still connected. Two deliberate choices here:
+        #
+        #  * The right side is checked against `hi` (the mesh top), NOT
+        #    against `right_bound` (the next plane's original, pre-refinement
+        #    slot). That slot can sit inside a region that only reconnects
+        #    higher up — e.g. a statue's arm that hangs free and is anchored
+        #    only at the shoulder — making [c, right_bound] disconnected for
+        #    EVERY c and leaving the plane no safe spot, so it falls back to
+        #    the widest cross-section (the base) and slices off a wafer.
+        #    Checking [c, hi] instead asks the correct question: "is the
+        #    material above this cut still all one piece?" The actual next
+        #    piece [c, next_cut] gets validated in its own right when the
+        #    next plane is placed (as that plane's left-piece check), so
+        #    every real piece is still covered.
+        #  * left_bound is the PREVIOUS plane's refined position, so
+        #    [left_bound, c] is exactly the piece being finalized now.
+        def _is_safe(c: float) -> bool:
+            return _is_single_component_cached(
+                mesh, axis_idx, left_bound, c, connectivity_cache, graph_index
+            ) and _is_single_component_cached(
+                mesh, axis_idx, c, hi, connectivity_cache, graph_index
+            )
+
+        # Fast path / minimum-displacement anchor: if the plane's own
+        # (evenly-spaced) position is already safe, keep it exactly — most
+        # planes don't sit anywhere near a pinch, and the search below only
+        # exists to route the few that do around a floating-region cut.
+        # Keeping the rest put is what preserves uniform piece thicknesses.
+        if _is_safe(p_clamped):
+            refined.append(p_clamped)
+            continue
+
         chosen = p_clamped
         # Widen the search in stages: try a small band around p first so
         # symmetric spacing is preserved when nothing's wrong, then expand
@@ -870,27 +917,30 @@ def refine_cut_planes(
             )
             max_area = scored[0][1] if scored else 0.0
 
-            # Each check is expensive (two real mesh `split()` calls, each
-            # O(faces) — on a heavy mesh this dominates runtime completely).
-            # Serially checking candidates one at a time with early-exit
-            # works well when the first few are usually safe, but on a mesh
-            # where many candidates in a row are genuinely unsafe (e.g. an
-            # appendage that stays disconnected across a wide band), that
-            # degrades to checking almost the whole batch anyway — just one
-            # at a time. So the *whole* batch (near-best-by-proximity, then
-            # the top-K fallback) is checked via `_batch_is_safe`, which runs
-            # them concurrently when `executor` was handed a heavy enough
-            # mesh to be worth it; either way, the result (closest-safe-
-            # candidate, or top-K-by-area fallback) is identical to the old
-            # purely-sequential early-exit version, just not serialized.
-            near_best = [c for c, a in scored if max_area <= 0 or a >= max_area / improvement_ratio]
-            near_best_by_proximity = sorted(near_best, key=lambda c: abs(c - p_clamped))
+            # Among connectivity-safe candidates, take the one CLOSEST to the
+            # plane's even position — the minimum move that escapes the
+            # floating-region cut — rather than the largest cross-section.
+            # Steering toward maximum area drags cuts toward whatever is
+            # widest (a statue's base, a torso's hips), which on a figure
+            # pulls neighboring planes together into thin slices even though
+            # a safe cut existed much closer to where the plane started. The
+            # connectivity check already rules out the disconnected cuts;
+            # once a cut is safe, keeping spacing uniform matters more than
+            # squeezing out extra joint area. `by_proximity` is the whole
+            # candidate set ordered by distance from p; `_batch_is_safe`
+            # checks them concurrently on a heavy mesh (see its docstring),
+            # so first-safe-by-proximity is just an ordered scan of that
+            # result, not a serialized per-candidate wait.
+            by_proximity = sorted((c for c, _a in scored), key=lambda c: abs(c - p_clamped))
+            # Right side checked against `hi`, not `right_bound` — see the
+            # `_is_safe` comment above for why the next plane's original slot
+            # is the wrong bound for the connectivity question.
             safety = _batch_is_safe(
-                executor, mesh, axis_idx, near_best_by_proximity, left_bound, right_bound,
+                executor, mesh, axis_idx, by_proximity, left_bound, hi,
                 max_workers=max_workers, cache=connectivity_cache, graph_index=graph_index,
             )
             found = False
-            for c in near_best_by_proximity:
+            for c in by_proximity:
                 if safety[c]:
                     chosen = c
                     found = True
@@ -898,27 +948,12 @@ def refine_cut_planes(
             if found:
                 break
 
-            # Nothing near `p` worked; fall back to the highest-area
-            # candidates overall, but only check a bounded number of them —
-            # a much-smaller-area candidate is rarely going to be the right
-            # answer anyway, and checking the full sample set here is what
-            # made this pathologically slow on large/complex meshes.
-            _TOP_K_FALLBACK = 6
-            fallback_candidates = [c for c, _a in scored[:_TOP_K_FALLBACK]]
-            fallback_safety = _batch_is_safe(
-                executor, mesh, axis_idx, fallback_candidates, left_bound, right_bound,
-                max_workers=max_workers, cache=connectivity_cache, graph_index=graph_index,
-            )
-            for c in fallback_candidates:
-                if fallback_safety[c]:
-                    chosen = c
-                    found = True
-                    break
-            if found:
-                break
-
-            # Nothing safe in this window; remember the largest-area
-            # candidate as a fallback and try a wider window next.
+            # Nothing safe anywhere in this window (by_proximity already
+            # covered the whole candidate set). Remember the largest-area
+            # candidate as the best effort and widen to the next stage —
+            # cutting.py's post-cut check still catches a genuine floating
+            # region and raises a clear error rather than silently shipping
+            # one.
             if scored:
                 chosen = scored[0][0]
 

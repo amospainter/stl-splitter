@@ -7,15 +7,18 @@ import sys
 
 from .connectors import SUPPORTED_SHAPES
 from .export import BED_SIZE_PRESETS, DEFAULT_BED_SIZE, SUPPORTED_FORMATS, export_pieces
-from .geometry import Cut, load_mesh
+from .geometry import Cut, load_mesh, scale_mesh
+from .hollow import hollow_mesh
 from .pipeline import PipelineParams, run_pipeline
 
+# Subcommand names recognized as the first positional argument. Kept
+# separate from the split subparser's own flags (e.g. --out) so that
+# `sys.argv[1]` can be checked against this set to decide whether to
+# default to "split" for backward compatibility (see main()).
+_SUBCOMMANDS = ("split", "hollow", "resize")
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="stlsplit",
-        description="Scale, split, and add connector dowels to an STL for print-bed-sized output.",
-    )
+
+def _add_split_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("input", help="Path to source STL file")
 
     scale_group = p.add_mutually_exclusive_group()
@@ -96,13 +99,94 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--out", required=True, help="Output directory")
 
+
+def _add_hollow_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("input", help="Path to source STL file")
+    p.add_argument("--wall", type=float, required=True, help="Wall thickness in mm to hollow out to")
+    p.add_argument("--out", required=True, help="Output STL file path")
+    p.add_argument(
+        "--allow-non-watertight",
+        action="store_true",
+        help="Proceed even if the mesh is not watertight after automatic repair is attempted; hollowing may fail or produce bad geometry",
+    )
+
+
+def _add_resize_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("input", help="Path to source STL file")
+    p.add_argument("--axis", choices=["x", "y", "z"], help="Axis --target-dim applies to (required with --target-dim)")
+    scale_group = p.add_mutually_exclusive_group(required=True)
+    scale_group.add_argument("--scale", type=float, help="Uniform scale factor")
+    scale_group.add_argument("--target-dim", type=float, help="Target size (mm) on --axis")
+    p.add_argument("--out", required=True, help="Output STL file path")
+    p.add_argument(
+        "--allow-non-watertight",
+        action="store_true",
+        help="Proceed even if the mesh is not watertight after automatic repair is attempted",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="stlsplit",
+        description="Scale, split, and add connector dowels to an STL for print-bed-sized output.",
+    )
+    subparsers = p.add_subparsers(dest="command")
+
+    split_p = subparsers.add_parser(
+        "split", help="Scale, split, and add connector dowels to an STL for print-bed-sized output (default)"
+    )
+    _add_split_args(split_p)
+
+    hollow_p = subparsers.add_parser("hollow", help="Hollow out an STL to a given wall thickness and write a new STL")
+    _add_hollow_args(hollow_p)
+
+    resize_p = subparsers.add_parser("resize", help="Scale an STL by a factor or to a target dimension and write a new STL")
+    _add_resize_args(resize_p)
+
     return p
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+def _run_hollow(args: argparse.Namespace) -> int:
+    try:
+        mesh = load_mesh(args.input, allow_non_watertight=args.allow_non_watertight)
+        hollowed = hollow_mesh(mesh, args.wall)
+    except (ValueError, RuntimeError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
 
+    out_dir = os.path.dirname(args.out)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    data = hollowed.export(file_type="stl")
+    if isinstance(data, str):
+        data = data.encode()
+    with open(args.out, "wb") as f:
+        f.write(data)
+    print(f"Wrote {args.out}")
+    return 0
+
+
+def _run_resize(args: argparse.Namespace) -> int:
+    try:
+        mesh = load_mesh(args.input, allow_non_watertight=args.allow_non_watertight)
+        resized = scale_mesh(mesh, scale=args.scale, target_dim=args.target_dim, axis=args.axis)
+    except (ValueError, RuntimeError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    out_dir = os.path.dirname(args.out)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    data = resized.export(file_type="stl")
+    if isinstance(data, str):
+        data = data.encode()
+    with open(args.out, "wb") as f:
+        f.write(data)
+    print(f"Wrote {args.out}")
+    return 0
+
+
+def _run_split(args: argparse.Namespace) -> int:
     bed_dims = {}
     if args.bed_x is not None:
         bed_dims["x"] = args.bed_x
@@ -200,6 +284,26 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Wrote {out_path}")
 
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+
+    # Backward compatibility: earlier versions had no subcommands and took
+    # the STL path directly as the first argument. Default to "split" when
+    # the first argument isn't itself a recognized subcommand name (or a
+    # help/version flag), so existing invocations keep working unchanged.
+    if not argv or (argv[0] not in _SUBCOMMANDS and not argv[0].startswith("-")):
+        argv = ["split", *argv]
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.command == "hollow":
+        return _run_hollow(args)
+    if args.command == "resize":
+        return _run_resize(args)
+    return _run_split(args)
 
 
 if __name__ == "__main__":
