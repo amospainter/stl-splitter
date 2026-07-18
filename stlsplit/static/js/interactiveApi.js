@@ -57,10 +57,43 @@ export async function rotatePiece(sessionId, pieceId, formData) {
   return data;
 }
 
+export async function alignPiece(sessionId, pieceId) {
+  const resp = await fetch(`/sessions/${sessionId}/pieces/${pieceId}/align`, { method: "POST" });
+  const data = await resp.json();
+  if (!resp.ok) throw new Error(data.detail || "align failed");
+  return data;
+}
+
 export async function undoCut(sessionId, pieceId) {
   const resp = await fetch(`/sessions/${sessionId}/pieces/${pieceId}/undo`, { method: "POST" });
   const data = await resp.json();
   if (!resp.ok) throw new Error(data.detail || "undo failed");
+  return data;
+}
+
+export async function exportSession(sessionId) {
+  // Returns the raw Blob (not JSON-parsed) plus the filename the server
+  // suggested via Content-Disposition, so the caller can trigger a browser
+  // download without re-serializing anything client-side.
+  const resp = await fetch(`/sessions/${sessionId}/export`);
+  if (!resp.ok) {
+    const data = await resp.json().catch(() => ({}));
+    throw new Error(data.detail || "export failed");
+  }
+  const disposition = resp.headers.get("Content-Disposition") || "";
+  const match = disposition.match(/filename="([^"]+)"/);
+  const filename = match ? match[1] : "session.json";
+  const blob = await resp.blob();
+  return { blob, filename };
+}
+
+export async function resumeSession(originalFile, sessionJsonFile) {
+  const fd = new FormData();
+  fd.set("file", originalFile);
+  fd.set("session_json", sessionJsonFile);
+  const resp = await fetch("/sessions/resume", { method: "POST", body: fd });
+  const data = await resp.json();
+  if (!resp.ok) throw new Error(data.detail || "resume failed");
   return data;
 }
 

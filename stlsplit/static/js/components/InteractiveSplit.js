@@ -56,15 +56,55 @@ export default {
             <div v-if="startError" class="alert alert-danger mt-2 py-2 mb-0 small">{{ startError }}</div>
           </div>
         </div>
+
+        <div class="card mb-3 compact-form-card">
+          <div class="card-header fw-semibold">Resume a saved session</div>
+          <div class="card-body">
+            <div class="form-text small mb-2">
+              Restores a previously exported session exactly as it was (cuts, rotations, everything) --
+              requires the ORIGINAL STL file (same one you started with) plus the session JSON downloaded via
+              "Export session" while that session was active.
+            </div>
+            <div class="row g-2">
+              <div class="col-6">
+                <label class="form-label small">Original STL file</label>
+                <input type="file" class="form-control form-control-sm" accept=".stl" @change="onResumeFileChange">
+              </div>
+              <div class="col-6">
+                <label class="form-label small">Session JSON</label>
+                <input type="file" class="form-control form-control-sm" accept=".json" @change="onResumeJsonChange">
+              </div>
+            </div>
+            <button type="button" class="btn btn-outline-primary mt-3" :disabled="!pendingResumeFile || !pendingResumeJson || resuming" @click="onResume">
+              <span v-if="resuming" class="spinner-border spinner-border-sm me-2"></span>
+              Resume session
+            </button>
+            <div v-if="resumeError" class="alert alert-danger mt-2 py-2 mb-0 small">{{ resumeError }}</div>
+          </div>
+        </div>
       </template>
 
       <template v-else>
         <div class="d-flex align-items-center justify-content-between mb-2">
           <span class="small text-secondary">Session active — {{ store.leafPieces.value.length }} current piece(s)</span>
-          <button type="button" class="btn btn-outline-danger btn-sm" @click="onResetSession">
-            <i class="bi bi-x-lg me-1"></i>Discard session
-          </button>
+          <div class="d-flex gap-2">
+            <button type="button" class="btn btn-outline-secondary btn-sm" :disabled="!lastCutId || undoing" @click="onUndoLast"
+                    :title="lastCutId ? 'Undo the most recent cut' : 'No cuts to undo yet'">
+              <span v-if="undoing" class="spinner-border spinner-border-sm me-1"></span>
+              <i v-else class="bi bi-arrow-counterclockwise me-1"></i>Undo last cut
+            </button>
+            <button type="button" class="btn btn-outline-secondary btn-sm" :disabled="exporting" @click="onExportSession"
+                    title="Download a JSON snapshot of this session's cuts/rotations, so it can be resumed later even if the server restarts">
+              <span v-if="exporting" class="spinner-border spinner-border-sm me-1"></span>
+              <i v-else class="bi bi-download me-1"></i>Export session
+            </button>
+            <button type="button" class="btn btn-outline-danger btn-sm" @click="onResetSession">
+              <i class="bi bi-x-lg me-1"></i>Discard session
+            </button>
+          </div>
         </div>
+        <div v-if="undoError" class="alert alert-danger py-2 mb-2 small">{{ undoError }}</div>
+        <div v-if="exportError" class="alert alert-danger py-2 mb-2 small">{{ exportError }}</div>
 
         <div class="card mb-3">
           <div class="card-header fw-semibold">
@@ -87,6 +127,10 @@ export default {
                         {{ a.toUpperCase() }}<i class="bi bi-arrow-clockwise"></i>
                       </button>
                     </div>
+                    <button type="button" class="btn btn-outline-secondary btn-sm" :disabled="rotating || !activeHasCutParent"
+                            @click="onAlign" title="Rotate this piece so the cut face that produced it lines up with the nearest axis">
+                      <i class="bi bi-magnet me-1"></i>Align to cut
+                    </button>
                     <span class="spinner-border spinner-border-sm text-secondary" v-if="rotating"></span>
                   </div>
                   <div v-if="rotateError" class="alert alert-danger py-2 mb-2 small">{{ rotateError }}</div>
@@ -170,17 +214,18 @@ export default {
 
               <div class="col-lg-7 order-lg-2">
                 <div class="d-flex align-items-center gap-2 mb-2 flex-wrap small" v-if="store.activePieceId.value">
-                  <div class="form-check mb-0">
+                  <span class="text-secondary">Bed size:</span>
+                  <input type="number" class="form-control form-control-sm" style="width: 70px" v-model.number="bedOverlay.x" title="Bed X (mm)">
+                  <span class="text-secondary">&times;</span>
+                  <input type="number" class="form-control form-control-sm" style="width: 70px" v-model.number="bedOverlay.y" title="Bed Y (mm)">
+                  <span class="text-secondary">&times;</span>
+                  <input type="number" class="form-control form-control-sm" style="width: 70px" v-model.number="bedOverlay.z" title="Bed Z / height (mm)">
+                  <span class="text-secondary">mm</span>
+                  <div class="form-check mb-0 ms-2">
                     <input type="checkbox" class="form-check-input" id="i-show-bed" v-model="bedOverlay.show">
-                    <label class="form-check-label" for="i-show-bed">Show print bed</label>
+                    <label class="form-check-label" for="i-show-bed">Show in 3D</label>
                   </div>
                   <template v-if="bedOverlay.show">
-                    <input type="number" class="form-control form-control-sm" style="width: 70px" v-model.number="bedOverlay.x" title="Bed X (mm)">
-                    <span class="text-secondary">&times;</span>
-                    <input type="number" class="form-control form-control-sm" style="width: 70px" v-model.number="bedOverlay.y" title="Bed Y (mm)">
-                    <span class="text-secondary">&times;</span>
-                    <input type="number" class="form-control form-control-sm" style="width: 70px" v-model.number="bedOverlay.z" title="Bed Z / height (mm)">
-                    <span class="text-secondary">mm</span>
                     <div class="form-check mb-0 ms-2">
                       <input type="checkbox" class="form-check-input" id="i-bed-grid" v-model="bedOverlay.grid">
                       <label class="form-check-label" for="i-bed-grid">Tile as grid</label>
@@ -225,6 +270,11 @@ export default {
                   <div class="card-body py-2 px-2 small">
                     <div class="text-truncate">{{ p.id.slice(0, 8) }}</div>
                     <div class="text-secondary">{{ p.extents.map(e => e.toFixed(0)).join(' × ') }} mm</div>
+                    <span class="badge mt-1" :class="bedFit(p).fits ? 'text-bg-success' : 'text-bg-danger'"
+                          :title="bedFit(p).fits ? 'Fits the configured bed on every axis' : 'Exceeds the bed on ' + bedFit(p).overAxes.join(', ').toUpperCase()">
+                      <i class="bi" :class="bedFit(p).fits ? 'bi-check-lg' : 'bi-exclamation-triangle'"></i>
+                      {{ bedFit(p).fits ? 'Fits bed' : 'Too big: ' + bedFit(p).overAxes.join('/').toUpperCase() }}
+                    </span>
                   </div>
                 </div>
               </div>
@@ -333,6 +383,14 @@ export default {
     const cutError = ref("");
     const rotating = ref(false);
     const rotateError = ref("");
+    const undoing = ref(false);
+    const undoError = ref("");
+    const exporting = ref(false);
+    const exportError = ref("");
+    const pendingResumeFile = ref(null);
+    const pendingResumeJson = ref(null);
+    const resuming = ref(false);
+    const resumeError = ref("");
     const modalPiece = ref(null);
     const modalColor = ref(0xe4e7ee);
 
@@ -381,6 +439,39 @@ export default {
       pendingFile.value = null;
     }
 
+    async function onExportSession() {
+      exporting.value = true;
+      exportError.value = "";
+      try {
+        await store.exportSessionFile();
+      } catch (err) {
+        exportError.value = err.message;
+      } finally {
+        exporting.value = false;
+      }
+    }
+
+    function onResumeFileChange(e) {
+      pendingResumeFile.value = e.target.files[0] || null;
+    }
+
+    function onResumeJsonChange(e) {
+      pendingResumeJson.value = e.target.files[0] || null;
+    }
+
+    async function onResume() {
+      if (!pendingResumeFile.value || !pendingResumeJson.value) return;
+      resuming.value = true;
+      resumeError.value = "";
+      try {
+        await store.resumeFromFiles(pendingResumeFile.value, pendingResumeJson.value);
+      } catch (err) {
+        resumeError.value = err.message;
+      } finally {
+        resuming.value = false;
+      }
+    }
+
     async function onCut() {
       cutting.value = true;
       cutError.value = "";
@@ -403,6 +494,52 @@ export default {
       } finally {
         rotating.value = false;
       }
+    }
+
+    async function onAlign() {
+      rotating.value = true;
+      rotateError.value = "";
+      try {
+        await store.alignActivePiece();
+      } catch (err) {
+        rotateError.value = err.message;
+      } finally {
+        rotating.value = false;
+      }
+    }
+
+    const lastCutId = computed(() => store.tree.cutOrder[store.tree.cutOrder.length - 1] || null);
+
+    async function onUndoLast() {
+      undoing.value = true;
+      undoError.value = "";
+      try {
+        await store.undoLastCut();
+      } catch (err) {
+        undoError.value = err.message;
+      } finally {
+        undoing.value = false;
+      }
+    }
+
+    // Whether the active piece came from a cut at all (vs. being the
+    // original root) -- "Align to cut" is a no-op on the root, so it's
+    // disabled there rather than left to silently do nothing.
+    const activeHasCutParent = computed(() => {
+      const piece = store.activePiece.value;
+      return !!(piece && piece.parentId);
+    });
+
+    // Per-piece bed-fit check: does every axis extent fit within the
+    // configured bed size? Purely a numeric AABB comparison against
+    // whatever's in the bed-size inputs above -- independent of whether the
+    // 3D bed overlay is toggled on, so this works as an always-on sanity
+    // check rather than something the user has to remember to enable.
+    function bedFit(piece) {
+      const dims = [bedOverlay.x, bedOverlay.y, bedOverlay.z];
+      const axisNames = ["x", "y", "z"];
+      const overAxes = axisNames.filter((_, i) => dims[i] > 0 && piece.extents[i] > dims[i] + 1e-6);
+      return { fits: overAxes.length === 0, overAxes };
     }
 
     function bufferFor(pieceId) {
@@ -450,7 +587,11 @@ export default {
     return {
       store, axes: AXES, paletteHex,
       pendingFile, starting, startError, cutting, cutError, rotating, rotateError,
-      onFileChange, onStart, onResetSession, onCut, onRotate, onPlaneDrag,
+      onFileChange, onStart, onResetSession, onCut, onRotate, onAlign, onPlaneDrag,
+      activeHasCutParent, bedFit, lastCutId, undoing, undoError, onUndoLast,
+      exporting, exportError, onExportSession,
+      pendingResumeFile, pendingResumeJson, resuming, resumeError,
+      onResumeFileChange, onResumeJsonChange, onResume,
       bufferFor, activeBuffer, axisData, bedOverlay, bedDims, bedGridCounts, lo, hi, step, tiltLabel, cutHistory, downloadUrl,
       modalPiece, modalColor, openModal, tiltMax: TILT_MAX, tiltTicks: TILT_TICKS,
     };

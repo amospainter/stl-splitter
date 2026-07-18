@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from fastapi import FastAPI, Form, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -540,7 +541,14 @@ async def create_session_endpoint(
     else:
         scale_factor = 1.0
 
-    session = create_session(mesh, filename, scale_factor)
+    create_params = {
+        "scale": scale_val,
+        "target_dim": target_dim_val,
+        "scale_axis": scale_axis,
+        "hollow_wall": hollow_val,
+        "allow_non_watertight": allow_non_watertight,
+    }
+    session = create_session(mesh, filename, scale_factor, create_params=create_params)
     root = session.pieces["root"]
     return {
         "session_id": session.id,
@@ -560,6 +568,102 @@ async def session_tree(session_id: str):
     if session is None:
         return JSONResponse({"detail": "Unknown or expired session"}, status_code=404)
     return tree_summary(session)
+
+
+@app.get("/sessions/{session_id}/export")
+async def export_session_endpoint(session_id: str):
+    """Lightweight, downloadable JSON snapshot of everything needed to
+    reconstruct this session later via POST /sessions/resume: the
+    scale/hollow parameters used to build the root piece, plus the full
+    cut/rotate/align/undo history (see sessions.replay_history). Deliberately
+    excludes all mesh data -- resuming re-derives every piece's geometry by
+    replaying against a re-uploaded copy of the ORIGINAL file, which the
+    caller must keep track of separately (this alone can't resume anything;
+    see the frontend's Export/Resume flow, which pairs it with a reminder to
+    keep the source STL)."""
+    from .sessions import get_session
+
+    session = get_session(session_id)
+    if session is None:
+        return JSONResponse({"detail": "Unknown or expired session"}, status_code=404)
+    with session.lock:
+        payload = {
+            "format": "stlsplit-session-v1",
+            "original_filename": session.filename,
+            "create_params": session.create_params,
+            "history": session.history,
+        }
+    basename = os.path.splitext(os.path.basename(session.filename))[0]
+    body = json.dumps(payload, indent=2).encode("utf-8")
+    return StreamingResponse(
+        io.BytesIO(body),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{basename}_session.json"'},
+    )
+
+
+@app.post("/sessions/resume")
+async def resume_session_endpoint(file: UploadFile, session_json: UploadFile):
+    """Recreates a session from an original STL plus a JSON snapshot
+    downloaded from GET /sessions/{id}/export: re-runs the exact same
+    scale/hollow steps create_session_endpoint used originally (from
+    `create_params`), then replays every recorded cut/rotate/align/undo in
+    order (sessions.replay_history) to rebuild the identical piece tree.
+    `file` must be the SAME original STL the session was created from --
+    replay reproduces geometry deterministically from it, not from anything
+    persisted about the pieces themselves, so a different file produces a
+    different (likely broken) tree."""
+    from .geometry import axis_index, scale_mesh
+    from .hollow import hollow_mesh
+    from .sessions import create_session, replay_history, tree_summary
+
+    raw = await file.read()
+    filename = file.filename or "input.stl"
+    try:
+        payload = json.loads(await session_json.read())
+    except json.JSONDecodeError:
+        return JSONResponse({"detail": "session_json is not valid JSON"}, status_code=400)
+    if payload.get("format") != "stlsplit-session-v1":
+        return JSONResponse({"detail": "Unrecognized session file format"}, status_code=400)
+
+    params = payload.get("create_params", {})
+    history = payload.get("history", [])
+
+    def _prepare():
+        mesh = load_mesh_from_bytes(raw, filename, allow_non_watertight=params.get("allow_non_watertight", False))
+        pre_extent = float(mesh.extents[axis_index(params.get("scale_axis", "z"))])
+        mesh = scale_mesh(
+            mesh, scale=params.get("scale"), target_dim=params.get("target_dim"), axis=params.get("scale_axis", "z")
+        )
+        if params.get("hollow_wall") is not None:
+            mesh = hollow_mesh(mesh, params["hollow_wall"])
+        return mesh, pre_extent
+
+    try:
+        mesh, pre_extent = await asyncio.to_thread(_prepare)
+    except (ValueError, RuntimeError) as e:
+        return JSONResponse({"detail": f"Could not reproduce the original starting mesh: {e}"}, status_code=400)
+
+    if params.get("scale") is not None:
+        scale_factor = params["scale"]
+    elif params.get("target_dim") is not None and pre_extent > 0:
+        scale_factor = params["target_dim"] / pre_extent
+    else:
+        scale_factor = 1.0
+
+    session = create_session(mesh, filename, scale_factor, create_params=params)
+    try:
+        cut_order = await asyncio.to_thread(replay_history, session, history)
+    except (KeyError, ValueError) as e:
+        from .sessions import close_session
+
+        close_session(session.id)
+        return JSONResponse({"detail": f"session_json doesn't match this STL (replay failed: {e})"}, status_code=400)
+
+    summary = tree_summary(session)
+    summary["scale_factor"] = scale_factor
+    summary["cut_order"] = cut_order
+    return summary
 
 
 @app.get("/sessions/{session_id}/pieces/{piece_id}/preview")
@@ -708,6 +812,32 @@ async def rotate_piece_endpoint(session_id: str, piece_id: str, axis: str = Form
     }
 
 
+@app.post("/sessions/{session_id}/pieces/{piece_id}/align")
+async def align_piece_endpoint(session_id: str, piece_id: str):
+    """Rotates a leaf piece so the cut face that produced it snaps to its
+    nearest world axis -- meant for pieces from a tilted cut, whose AABB
+    otherwise reports an inflated footprint. See sessions.align_piece_to_cut."""
+    from .sessions import align_piece_to_cut, get_session
+
+    session = get_session(session_id)
+    if session is None:
+        return JSONResponse({"detail": "Unknown or expired session"}, status_code=404)
+    try:
+        with session.lock:
+            node = align_piece_to_cut(session, piece_id)
+    except KeyError as e:
+        return JSONResponse({"detail": str(e).strip("'\"")}, status_code=400)
+    except Exception as e:  # noqa: BLE001 - surface unexpected errors instead of a bare 500
+        return JSONResponse({"detail": f"Unexpected error: {e}"}, status_code=400)
+
+    return {
+        "piece_id": node.id,
+        "extents": node.mesh.extents.tolist(),
+        "volume": float(node.mesh.volume),
+        "bounds": node.mesh.bounds.tolist(),
+    }
+
+
 @app.delete("/sessions/{session_id}")
 async def delete_session_endpoint(session_id: str):
     from .sessions import close_session
@@ -771,12 +901,41 @@ async def finish_session(
             reporter = ProgressReporter(on_update, cancel_event=job.cancel_event)
             with session.lock:
                 leaf_ids = sorted(session.leaves)
-                leaf_meshes = [session.pieces[pid].mesh for pid in leaf_ids]
+                leaf_nodes = [session.pieces[pid] for pid in leaf_ids]
+                # `applied_cuts` records each cut plane in the frame it was
+                # cut in -- a leaf later reoriented via rotate/align (see
+                # PieceNode.display_rotation) no longer has its cut faces
+                # sitting on that recorded plane, so connector placement
+                # must run against each leaf's UN-rotated geometry (undoing
+                # display_rotation) rather than its current, possibly
+                # reoriented `mesh`. Pieces never reoriented have an
+                # identity display_rotation, so this is a no-op for them.
+                canonical_meshes = []
+                for node in leaf_nodes:
+                    if np.allclose(node.display_rotation, np.eye(4)):
+                        canonical_meshes.append(node.mesh)
+                    else:
+                        canonical = node.mesh.copy()
+                        canonical.apply_transform(np.linalg.inv(node.display_rotation))
+                        canonical_meshes.append(canonical)
                 applied_cuts = list(session.applied_cuts)
             if connector_kwargs is not None:
-                pieces, dowels = add_connectors_after_cuts(leaf_meshes, applied_cuts, connector_kwargs, reporter)
+                pieces, dowels = add_connectors_after_cuts(canonical_meshes, applied_cuts, connector_kwargs, reporter)
             else:
-                pieces, dowels = leaf_meshes, []
+                pieces, dowels = canonical_meshes, []
+
+            # Re-apply each leaf's display rotation now that sockets are
+            # carved in the canonical frame -- brings every piece back to
+            # the orientation the user last saw/set it to in the editor.
+            reoriented = []
+            for node, piece in zip(leaf_nodes, pieces):
+                if np.allclose(node.display_rotation, np.eye(4)):
+                    reoriented.append(piece)
+                else:
+                    piece = piece.copy()
+                    piece.apply_transform(node.display_rotation)
+                    reoriented.append(piece)
+            pieces = reoriented
 
             basename = os.path.splitext(os.path.basename(session.filename))[0]
             job.result = _build_job_result(pieces, dowels, basename, format, bed_size)

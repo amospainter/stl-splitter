@@ -81,18 +81,41 @@ def _interface_polygon(piece: trimesh.Trimesh, origin: np.ndarray, normal: np.nd
     return polygon, to_3d
 
 
-def _piece_side(piece: trimesh.Trimesh, cut: ResolvedCut, tol: float = 1e-4) -> str | None:
+def _piece_side(
+    piece: trimesh.Trimesh, cut: ResolvedCut, tol: float = 1e-4, outlier_frac: float = 0.10
+) -> str | None:
     """Which side of `cut`'s plane `piece` sits on, if it was actually cut
     there: "a" if the piece touches the plane from the negative-normal side
     (max vertex distance within `tol` of 0, min distance clearly negative),
     "b" for the mirror case, or None if the piece doesn't touch this plane
     at all (was never cut here) or straddles it (wasn't cut here — a bug
-    elsewhere, or `cut` doesn't correspond to a real cut on this piece)."""
+    elsewhere, or `cut` doesn't correspond to a real cut on this piece).
+
+    The near-zero-side check uses the `outlier_frac`-percentile of `d`
+    rather than a strict max/min. A tilted cut through genuinely non-convex,
+    organic geometry (a limb, a fold) can leave a real, non-negligible
+    chunk of a piece dipping back across the cut plane locally even though
+    the piece is unambiguously "cut here" and correctly one-sided overall --
+    this isn't mesh noise, it's what a flat plane slicing through anatomy
+    that folds back on itself actually looks like. Measured on a real case:
+    up to ~5.8% of a piece's surface AREA (not just a handful of stray
+    vertices) sat on the nominally-wrong side at a legitimate, otherwise
+    perfectly good interface. A strict max/min let that disqualify the
+    ENTIRE interface (find_facing_pairs found no pair at all, costing every
+    connector at that cut), even though the piece plainly was cut there.
+    10% leaves real margin above the observed 5.8% while still correctly
+    rejecting a piece that genuinely doesn't touch this plane at all --
+    there, the split runs closer to even (not a small minority on one side),
+    so the percentile lands nowhere near zero and this still returns
+    None."""
     d = (piece.vertices - cut.origin) @ cut.normal
-    dmax, dmin = float(d.max()), float(d.min())
-    if dmax <= tol and dmin < -tol:
+    dmin = float(d.min())
+    near_max = float(np.percentile(d, 100.0 * (1.0 - outlier_frac)))
+    near_min = float(np.percentile(d, 100.0 * outlier_frac))
+    dmax = float(d.max())
+    if near_max <= tol and dmin < -tol:
         return "a"
-    if dmin >= -tol and dmax > tol:
+    if near_min >= -tol and dmax > tol:
         return "b"
     return None
 

@@ -9,7 +9,7 @@ import { reactive, ref, computed } from "vue";
 import { streamJob } from "./api.js";
 import {
   createSession, getPiecePreview, cutPiece, undoCut, deleteSession, finishSession,
-  piecePlanePreview, rotatePiece,
+  piecePlanePreview, rotatePiece, alignPiece, exportSession, resumeSession,
 } from "./interactiveApi.js";
 
 export function useInteractiveSplit() {
@@ -32,7 +32,13 @@ export function useInteractiveSplit() {
   const session = reactive({ id: null, scaleFactor: 1 });
 
   // pieces: { [piece_id]: { parentId, childrenIds, isLeaf, extents, volume, bounds } }
-  const tree = reactive({ pieces: {}, leaves: [] });
+  // cutOrder: chronological list of parent piece ids, one entry per cut
+  // performed (appended on cut, removed on undo) -- separate from object key
+  // order in `pieces`, which reflects when a piece node was first CREATED,
+  // not when it was last cut (a piece cut can be revisited/re-cut later out
+  // of creation order), so it's the only reliable way to know "the most
+  // recent cut" for an "Undo last cut" shortcut.
+  const tree = reactive({ pieces: {}, leaves: [], cutOrder: [] });
   const activePieceId = ref(null);
 
   // The single-axis cut editor for whichever piece is currently active.
@@ -181,6 +187,46 @@ export function useInteractiveSplit() {
     await selectPiece("root");
   }
 
+  // Downloads a JSON snapshot of this session (scale/hollow params + full
+  // cut/rotate/align/undo history) via GET .../export -- pairs with
+  // resumeFromFiles below. Triggers a real browser download rather than
+  // returning the blob, since that's the whole point (see web.py's
+  // export_session_endpoint for what's actually in the file, and why mesh
+  // data is deliberately NOT in it).
+  async function exportSessionFile() {
+    if (!session.id) return;
+    const { blob, filename } = await exportSession(session.id);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  // Recreates a session from an original STL + a previously-exported
+  // session JSON (POST /sessions/resume replays the recorded history
+  // server-side -- see sessions.replay_history). Populates the tree from
+  // the FULL resulting piece set, not just a root, since a resumed session
+  // is typically already many cuts deep; cut_order comes back pre-computed
+  // by replay_history rather than being rebuilt one cut at a time the way
+  // startSession/cutActivePiece do it live.
+  async function resumeFromFiles(originalFile, sessionJsonFile) {
+    const data = await resumeSession(originalFile, sessionJsonFile);
+    session.id = data.session_id;
+    session.scaleFactor = data.scale_factor;
+    tree.pieces = {};
+    for (const [pid, p] of Object.entries(data.pieces)) {
+      tree.pieces[pid] = {
+        parentId: p.parent_id, childrenIds: p.children_ids, isLeaf: p.is_leaf,
+        extents: p.extents, volume: p.volume, bounds: p.bounds,
+      };
+    }
+    tree.leaves = data.leaves;
+    tree.cutOrder = data.cut_order || [];
+    activePieceId.value = null;
+  }
+
   function clearErrorHighlights() {
     editor.planes.forEach((c) => { c.errored = false; });
   }
@@ -221,6 +267,7 @@ export function useInteractiveSplit() {
       };
     }
     tree.leaves = tree.leaves.filter((id) => id !== parentId).concat(data.children.map((c) => c.piece_id));
+    tree.cutOrder.push(parentId);
     // Fire-and-forget: pop each new leaf's preview into the grid as it loads
     // rather than blocking the cut on every child's STL round trip.
     data.children.forEach((c) => { ensurePreviewLoaded(c.piece_id); });
@@ -254,23 +301,48 @@ export function useInteractiveSplit() {
     await Promise.all([ensurePreviewLoaded(pieceId), fetchPlanePreview()]);
   }
 
+  async function alignActivePiece() {
+    if (!activePieceId.value) return;
+    const pieceId = activePieceId.value;
+    const data = await alignPiece(session.id, pieceId);
+
+    tree.pieces[pieceId] = {
+      ...tree.pieces[pieceId],
+      extents: data.extents, volume: data.volume, bounds: data.bounds,
+    };
+    // Same staleness concerns as rotateActivePiece -- the piece may have
+    // actually rotated (a no-op alignment leaves extents/bounds identical,
+    // which is harmless to refetch anyway).
+    previewBuffers.delete(pieceId);
+    editor.planes = [];
+    editor.spacing = "";
+    editor.pieces = "";
+    await Promise.all([ensurePreviewLoaded(pieceId), fetchPlanePreview()]);
+  }
+
   // Removes every descendant of `pieceId` from the local tree mirror,
   // matching the cascading server-side undo in sessions.py's undo_cut.
-  function pruneSubtree(pieceId) {
+  // Returns the set of removed piece ids so the caller can also strip them
+  // out of `tree.cutOrder` (a descendant could itself be the parent of a
+  // later cut, cascaded away here).
+  function pruneSubtree(pieceId, removedIds = new Set()) {
     const node = tree.pieces[pieceId];
-    if (!node) return;
+    if (!node) return removedIds;
     for (const childId of node.childrenIds) {
-      pruneSubtree(childId);
+      pruneSubtree(childId, removedIds);
       delete tree.pieces[childId];
       tree.leaves = tree.leaves.filter((id) => id !== childId);
+      removedIds.add(childId);
     }
     node.childrenIds = [];
     node.isLeaf = true;
+    return removedIds;
   }
 
   async function undoPieceCut(pieceId) {
     await undoCut(session.id, pieceId);
-    pruneSubtree(pieceId);
+    const removedIds = pruneSubtree(pieceId);
+    tree.cutOrder = tree.cutOrder.filter((id) => id !== pieceId && !removedIds.has(id));
     if (!tree.leaves.includes(pieceId)) tree.leaves.push(pieceId);
     if (activePieceId.value && !tree.pieces[activePieceId.value]) activePieceId.value = null;
     ensurePreviewLoaded(pieceId); // was already loaded pre-cut in the common case, but cheap to confirm
@@ -333,6 +405,7 @@ export function useInteractiveSplit() {
     session.scaleFactor = 1;
     tree.pieces = {};
     tree.leaves = [];
+    tree.cutOrder = [];
     activePieceId.value = null;
     previewBuffers.clear();
     resetEditor();
@@ -340,10 +413,17 @@ export function useInteractiveSplit() {
     job.result = null;
   }
 
+  async function undoLastCut() {
+    const lastId = tree.cutOrder[tree.cutOrder.length - 1];
+    if (!lastId) return;
+    await undoPieceCut(lastId);
+  }
+
   return {
     form, session, tree, activePieceId, activePiece, leafPieces, hasSession,
     editor, previewBuffers, job,
     startSession, selectPiece, setAxis, addCut, removeCut, schedulePlanePreview,
-    cutActivePiece, undoPieceCut, rotateActivePiece, finish, reset,
+    cutActivePiece, undoPieceCut, undoLastCut, rotateActivePiece, alignActivePiece, finish, reset,
+    exportSessionFile, resumeFromFiles,
   };
 }

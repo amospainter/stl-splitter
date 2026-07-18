@@ -7,7 +7,15 @@ import numpy as np
 import trimesh
 from scipy import ndimage
 
-_MAX_VOXELS_PER_AXIS = 220
+_MAX_VOXELS_PER_AXIS = 600
+
+# Independent of wall_thickness: real meshes can have narrow features (a
+# crease, a limb resting against the torso) far smaller than any reasonable
+# wall thickness. Pitch must stay at or below this regardless of how thick a
+# wall is requested, or those features get bridged/misclassified during
+# voxelization. See the note in hollow_mesh() for why this isn't just
+# min_pitch from the per-mesh voxel budget.
+_MAX_USEFUL_PITCH = 5.0
 
 # The erosion step below can only resolve a wall as fine as a handful of
 # voxel-widths — the distance transform's smallest possible nonzero reading
@@ -31,13 +39,29 @@ def hollow_mesh(mesh: trimesh.Trimesh, wall_thickness: float, pitch: float | Non
     if wall_thickness <= 0:
         raise ValueError("wall_thickness must be > 0")
 
-    if pitch is None:
-        pitch = max(wall_thickness / 3.0, 0.4)
-
     # cap voxel resolution so pathologically small pitches on large meshes
     # don't blow up memory/runtime
     max_extent = float(mesh.extents.max())
     min_pitch = max_extent / _MAX_VOXELS_PER_AXIS
+
+    if pitch is None:
+        # `wall_thickness / 3` alone is a poor pitch target for thick walls:
+        # it has nothing to do with how much *geometric* detail the mesh
+        # actually has. Real meshes have narrow features — creases, a limb
+        # resting against the torso — whose physical gap is unrelated to the
+        # requested wall thickness; a pitch coarser than that gap bridges it
+        # during `voxelized().fill()` and misclassifies material there,
+        # producing holes that `is_watertight` won't catch. Cap pitch at
+        # `_MAX_USEFUL_PITCH` regardless of how thick a wall was requested,
+        # so a 40mm-wall request on a huge mesh doesn't fall back to a grid
+        # too coarse to see a 5-10mm gap under an arm. (Uncapped use of the
+        # full per-mesh voxel budget was tried and rejected: on large,
+        # simple-geometry meshes it forces pitch far finer than the mesh has
+        # detail to justify, and `voxelized()`'s internal triangle
+        # subdivision can exceed its own iteration limit before reaching
+        # that pitch on a mesh with large flat faces.)
+        pitch = max(min(wall_thickness / 3.0, _MAX_USEFUL_PITCH), 0.4)
+
     if pitch < min_pitch:
         # The cap would force a pitch too coarse for this wall_thickness on a
         # mesh this large — proceeding would silently produce corrupted
